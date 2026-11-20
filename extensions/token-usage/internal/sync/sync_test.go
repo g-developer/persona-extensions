@@ -112,6 +112,65 @@ func TestLoopBackfillsThenPollsAndAlerts(t *testing.T) {
 	}
 }
 
+func TestPullAppliesUpstreamZeroCorrection(t *testing.T) {
+	minute := time.Date(2026, time.January, 2, 3, 4, 0, 0, time.UTC).Unix()
+	var mu sync.Mutex
+	point := hub.Point{T: minute, In: 100, Req: 3}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/machines":
+			write(w, map[string]any{"machines": []hub.Machine{{ID: "m-a"}}})
+		case "/api/v1/machines/m-a/usage":
+			if r.URL.Query().Get("model") == "" {
+				write(w, map[string]any{"usage": map[string]any{
+					"models": []hub.Share{{Name: "alpha"}}, "launchers": []hub.Share{{Name: "cli"}},
+				}})
+				return
+			}
+			mu.Lock()
+			p := point
+			mu.Unlock()
+			write(w, map[string]any{"usage": hub.Series{Step: 60, Points: []hub.Point{p}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	st := store.Open("")
+	bf := budget.Open("")
+	client := hub.New(srv.URL, "tok", nil)
+	readTotals := func() (int64, int) {
+		var total int64
+		var requests int
+		if err := st.View(func(state *store.State) error {
+			for _, day := range state.Days {
+				for _, b := range day.Buckets {
+					total += b.Total()
+					requests += b.Requests
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return total, requests
+	}
+
+	pull(context.Background(), client, st, bf, time.UTC, "24h")
+	if total, requests := readTotals(); total != 100 || requests != 3 {
+		t.Fatalf("first pull stored total %d and requests %d, want 100 and 3", total, requests)
+	}
+
+	mu.Lock()
+	point = hub.Point{T: minute}
+	mu.Unlock()
+	pull(context.Background(), client, st, bf, time.UTC, "24h")
+	if total, requests := readTotals(); total != 0 || requests != 0 {
+		t.Fatalf("zero correction left total %d and requests %d, want zero", total, requests)
+	}
+}
+
 func TestLoopStopsWithoutAHub(t *testing.T) {
 	done := make(chan struct{})
 	go func() {

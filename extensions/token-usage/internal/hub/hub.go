@@ -266,11 +266,11 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 
 // bucketsOf turns one filtered series into minute buckets of one model and launcher. A point covers step seconds,
 // so its tokens are spread evenly over its minutes; the first minute keeps the remainder and the requests, and the
-// minutes add back to the point.
+// minutes add back to the point. Non-gap zero points are kept so corrections can delete previously stored usage.
 func bucketsOf(s Series, model, launcher string) []store.Bucket {
 	var out []store.Bucket
 	for _, p := range s.Points {
-		if p.Gap || pointTotal(p) == 0 {
+		if p.Gap {
 			continue
 		}
 		minutes := p.Step / 60
@@ -290,9 +290,6 @@ func bucketsOf(s Series, model, launcher string) []store.Bucket {
 			if k == 0 {
 				b.Requests = p.Req
 			}
-			if b.Total() == 0 && b.Requests == 0 {
-				continue
-			}
 			out = append(out, b)
 		}
 	}
@@ -310,5 +307,3 @@ func part(total int64, minutes, minute int) int64 {
 	}
 	return each
 }
-
-func pointTotal(p Point) int64 { return p.In + p.CW + p.CR + p.Out }
