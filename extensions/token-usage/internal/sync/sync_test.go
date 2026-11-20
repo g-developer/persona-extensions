@@ -171,6 +171,68 @@ func TestPullAppliesUpstreamZeroCorrection(t *testing.T) {
 	}
 }
 
+// A hub without Postgres holds only the last 26 hours, so its 7d range reads zero before that: those zeros must not
+// delete the history the 24h pulls stored. A hub that stores the week is trusted for the whole range.
+func TestBackfillZerosDeleteOnlyWhenTheHubStoresTheWeek(t *testing.T) {
+	minute := time.Date(2026, time.January, 2, 3, 4, 0, 0, time.UTC).Unix()
+	var mu sync.Mutex
+	point, stored := hub.Point{T: minute, In: 100, Req: 3}, false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/machines":
+			write(w, map[string]any{"machines": []hub.Machine{{ID: "m-a"}}})
+		case "/api/v1/machines/m-a/usage":
+			if r.URL.Query().Get("model") == "" {
+				write(w, map[string]any{"usage": map[string]any{
+					"models": []hub.Share{{Name: "alpha"}}, "launchers": []hub.Share{{Name: "cli"}},
+				}})
+				return
+			}
+			mu.Lock()
+			s := hub.Series{Step: 60, Points: []hub.Point{point}, Stored: stored}
+			mu.Unlock()
+			write(w, map[string]any{"usage": s})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	st := store.Open("")
+	bf := budget.Open("")
+	client := hub.New(srv.URL, "tok", nil)
+	total := func() int64 {
+		var n int64
+		if err := st.View(func(state *store.State) error {
+			for _, day := range state.Days {
+				for _, b := range day.Buckets {
+					n += b.Total()
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	pull(context.Background(), client, st, bf, time.UTC, "24h")
+	mu.Lock()
+	point = hub.Point{T: minute}
+	mu.Unlock()
+	pull(context.Background(), client, st, bf, time.UTC, "7d")
+	if n := total(); n != 100 {
+		t.Fatalf("a 7d zero from a hub that keeps only memory left total %d, want 100 kept", n)
+	}
+	mu.Lock()
+	stored = true
+	mu.Unlock()
+	pull(context.Background(), client, st, bf, time.UTC, "7d")
+	if n := total(); n != 0 {
+		t.Fatalf("a 7d zero from a hub that stores the week left total %d, want 0", n)
+	}
+}
+
 func TestLoopStopsWithoutAHub(t *testing.T) {
 	done := make(chan struct{})
 	go func() {

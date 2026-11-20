@@ -54,7 +54,7 @@ func TestPullSplitsByModelAndLauncher(t *testing.T) {
 
 func TestBucketsSpreadAPointOverItsMinutes(t *testing.T) {
 	s := Series{Step: 600, Points: []Point{{T: 1000, Step: 600, In: 605, Out: 3, Req: 2}}}
-	got := bucketsOf(s, "alpha", "cli")
+	got := bucketsOf(s, "alpha", "cli", true)
 	if len(got) != 10 {
 		t.Fatalf("got %d minutes, want 10", len(got))
 	}
