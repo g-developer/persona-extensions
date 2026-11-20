@@ -1244,13 +1244,15 @@ func ref(prefix, s string) string {
 	return prefix + "#" + hex.EncodeToString(sum[:12])
 }
 
-// openAction opens eid: open:<entity> when that fits an action id, else open with the entity in the action's values
-// (UI version 4).
+// openAction opens eid: its page pushed on top (UI version 3), so the app's back button and swipe return to the page
+// below (#774). An older app calls open:<entity> instead (open with the entity in the action's values when that is
+// too long for an id, UI version 4), which draws the page in place with its own 返回.
 func openAction(eid string) *wire.Action {
+	push := &wire.Push{State: ext.EncodeState(pageState{Entity: eid})}
 	if id := "open:" + eid; len(id) <= idMost {
-		return &wire.Action{ID: id}
+		return &wire.Action{ID: id, Push: push}
 	}
-	return &wire.Action{ID: "open", Values: map[string]string{"entity": eid}}
+	return &wire.Action{ID: "open", Values: map[string]string{"entity": eid}, Push: push}
 }
 
 // areaAction opens an area: area:<id>, or area with the id in the action's values (an id may be as long as a name).
