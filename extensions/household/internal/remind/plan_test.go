@@ -584,16 +584,70 @@ func TestRunTodoAmbiguousCreateQuarantined(t *testing.T) {
 		t.Fatalf("quarantined = %v, want item:i-000", quarantined)
 	}
 
-	// Cleanup must not invent an ID or discard the record needed for manual reconciliation.
+	// A restart keeps the quarantine: a new reminder on the same state file does not create it either.
+	r = &Reminder{Hub: api, Path: path, Config: Config{Mode: "todos"}}
+	if err := r.Run(ctx, home, at(9, 15), cst); err != nil {
+		t.Fatal(err)
+	}
+	if api.creates != 1 {
+		t.Fatalf("after a restart the reminder made %d create calls, want 1", api.creates)
+	}
+
+	// The alert ends: there is no id to mark done, and the quarantine ends with it.
 	if err := r.Run(ctx, &model.Home{}, at(9, 20), cst); err != nil {
 		t.Fatal(err)
 	}
-	if len(api.done) != 0 || len(api.todos) != 1 {
-		t.Fatalf("cleanup marked %v done with %d persisted to-dos, want no completion and one to-do", api.done, len(api.todos))
+	if len(api.done) != 0 {
+		t.Fatalf("cleanup marked %v done, want nothing without an id", api.done)
 	}
-	quarantined, ok = readStateFile(t, path)["quarantined"].(map[string]any)
-	if !ok || quarantined["item:i-000"] != true {
-		t.Fatalf("cleanup discarded the quarantine: %v", quarantined)
+	if got, ok := readStateFile(t, path)["quarantined"]; ok {
+		t.Fatalf("quarantined = %v after the alert ended, want none", got)
+	}
+
+	// The item runs out again: that is a new alert, and it gets a to-do again, which is marked done as usual.
+	if err := r.Run(ctx, home, at(9, 30), cst); err != nil {
+		t.Fatal(err)
+	}
+	if api.creates != 2 || len(api.todos) != 2 {
+		t.Fatalf("the next occurrence made %d calls and %d to-dos, want 2 of each", api.creates, len(api.todos))
+	}
+	if err := r.Run(ctx, &model.Home{}, at(9, 40), cst); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(api.done, []string{"todo-2"}) {
+		t.Fatalf("done = %v, want [todo-2]", api.done)
+	}
+}
+
+func TestRunTodoQuarantineKeptWhileTodosOff(t *testing.T) {
+	ctx := context.Background()
+	api := newFake(ScopeTodos)
+	api.ambiguousCreate = 1
+	path := filepath.Join(t.TempDir(), "remind.json")
+	r := &Reminder{Hub: api, Path: path, Config: Config{Mode: "todos"}}
+	home := manyOutHome(2)
+	if err := r.Run(ctx, home, at(9, 0), cst); err == nil {
+		t.Fatal("Run returned nil, want the ambiguous create error")
+	}
+
+	// To-dos switched off and on again while the alerts last: the known to-do is marked done and made again, the
+	// quarantined one may still exist and is not.
+	r.Config.Mode = "notify"
+	if err := r.Run(ctx, home, at(9, 10), cst); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(api.done, []string{"todo-2"}) {
+		t.Fatalf("done = %v, want [todo-2]", api.done)
+	}
+	r.Config.Mode = "todos"
+	if err := r.Run(ctx, home, at(9, 20), cst); err != nil {
+		t.Fatal(err)
+	}
+	if api.creates != 3 {
+		t.Fatalf("create calls = %d, want 3: two first, then only the known one again", api.creates)
+	}
+	if q, _ := readStateFile(t, path)["quarantined"].(map[string]any); len(q) != 1 {
+		t.Fatalf("quarantined = %v, want the one ambiguous alert", q)
 	}
 }
 

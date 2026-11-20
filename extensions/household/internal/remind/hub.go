@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -148,12 +149,19 @@ func (h *Hub) CreateTodo(ctx context.Context, t Todo) (string, error) {
 	return out.Todo.ID, nil
 }
 
-// definiteCreateRejection reports whether the hub established that it rejected the create. A request timeout is
-// excluded because the hub may still commit it; transport failures, 5xx replies and invalid success replies are
-// likewise unknown outcomes rather than definite rejections.
-func definiteCreateRejection(err error) bool {
+// createNotMade reports whether err shows that the hub did not make the to-do, so that creating it again cannot
+// duplicate it: a 4xx reply other than 408 (the hub refused it), a 503 (the hub or the assistant is offline; the hub
+// answers 503 only for a request that never reached the assistant) and a failed dial (nothing was sent). Any other
+// failure is an unknown outcome: a 408, another 5xx (the hub's 502 assistant_in_doubt among them), a connection lost
+// after the request went out, or a success reply without a to-do id; the to-do may exist.
+func createNotMade(err error) bool {
 	var he *httpError
-	return errors.As(err, &he) && he.status >= 400 && he.status < 500 && he.status != http.StatusRequestTimeout
+	if errors.As(err, &he) {
+		return he.status >= 400 && he.status < 500 && he.status != http.StatusRequestTimeout ||
+			he.status == http.StatusServiceUnavailable
+	}
+	var oe *net.OpError
+	return errors.As(err, &oe) && oe.Op == "dial"
 }
 
 // DoneTodo marks a to-do done. A to-do the hub no longer has (404) is not an error.
