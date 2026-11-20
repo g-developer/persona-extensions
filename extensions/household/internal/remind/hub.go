@@ -148,6 +148,14 @@ func (h *Hub) CreateTodo(ctx context.Context, t Todo) (string, error) {
 	return out.Todo.ID, nil
 }
 
+// definiteCreateRejection reports whether the hub established that it rejected the create. A request timeout is
+// excluded because the hub may still commit it; transport failures, 5xx replies and invalid success replies are
+// likewise unknown outcomes rather than definite rejections.
+func definiteCreateRejection(err error) bool {
+	var he *httpError
+	return errors.As(err, &he) && he.status >= 400 && he.status < 500 && he.status != http.StatusRequestTimeout
+}
+
 // DoneTodo marks a to-do done. A to-do the hub no longer has (404) is not an error.
 func (h *Hub) DoneTodo(ctx context.Context, id string) error {
 	if id == "" {

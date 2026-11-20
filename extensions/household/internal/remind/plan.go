@@ -111,16 +111,17 @@ type Reminder struct {
 	Config Config
 }
 
-// state is what the reminder has already done: the day of the last notification, and the to-do id of each alert
-// key that has one.
+// state is what the reminder has already done: the day of the last notification, the to-do id of each alert
+// key that has one, and alert keys whose create outcome is unknown and must not be retried automatically.
 type state struct {
-	Notified string            `json:"notified,omitempty"`
-	Todos    map[string]string `json:"todos,omitempty"`
+	Notified    string            `json:"notified,omitempty"`
+	Todos       map[string]string `json:"todos,omitempty"`
+	Quarantined map[string]bool   `json:"quarantined,omitempty"`
 }
 
 // Run does what is due at now: the daily notification and the to-dos. It is called on every tick. A failing call
-// does not hold back the others: the errors are joined and returned, the state reached so far is saved, and what
-// failed is tried again on the next call.
+// does not hold back the others: the errors are joined and returned, the state reached so far is saved, and definite
+// failures are tried again on the next call. A create with an unknown outcome is quarantined instead of repeated.
 func (r *Reminder) Run(ctx context.Context, h *model.Home, now time.Time, loc *time.Location) error {
 	if r.Hub == nil {
 		return nil
@@ -196,8 +197,9 @@ func (r *Reminder) notify(ctx context.Context, st *state, h *model.Home, now tim
 }
 
 // todos creates a to-do for each alert that has none, when create is set (at most maxTodos attempts per run), and
-// marks done the to-dos whose alert is gone, or all of them when create is not set. A failed call is recorded and
-// the rest go on; the failed to-do is tried again on the next run.
+// marks done the to-dos whose alert is gone, or all of them when create is not set. A definite rejection is retried
+// on the next run. An unknown outcome is quarantined because repeating the POST could duplicate a committed to-do.
+// Quarantined alerts have no known ID to complete and stay recorded for manual reconciliation.
 func (r *Reminder) todos(ctx context.Context, st *state, h *model.Home, today model.Day, create bool) error {
 	if st.Todos == nil {
 		st.Todos = map[string]string{}
@@ -211,12 +213,18 @@ func (r *Reminder) todos(ctx context.Context, st *state, h *model.Home, today mo
 	attempts := 0
 	for _, a := range alerts {
 		live[a.Key] = true
-		if _, ok := st.Todos[a.Key]; ok || attempts == maxTodos {
+		if _, ok := st.Todos[a.Key]; ok || st.Quarantined[a.Key] || attempts == maxTodos {
 			continue
 		}
 		attempts++
 		id, err := r.Hub.CreateTodo(ctx, Todo{Title: a.Title, Notes: a.Notes, DueDate: string(today)})
 		if err != nil {
+			if !definiteCreateRejection(err) {
+				if st.Quarantined == nil {
+					st.Quarantined = map[string]bool{}
+				}
+				st.Quarantined[a.Key] = true
+			}
 			errs = append(errs, fmt.Errorf("创建待办 %q：%w", a.Title, err))
 			continue
 		}

@@ -26,11 +26,12 @@ type fakeAPI struct {
 	notices   []Notice
 	notifyErr error
 
-	creates     int    // CreateTodo calls, failed ones included
-	failCreate  int    // the 1-based CreateTodo call that fails; 0 for none
-	failCreates bool   // every CreateTodo fails
-	todos       []Todo // created to-dos, in order
-	nextID      int
+	creates         int    // CreateTodo calls, failed ones included
+	failCreate      int    // the 1-based CreateTodo call that is definitely rejected; 0 for none
+	failCreates     bool   // every CreateTodo is definitely rejected
+	ambiguousCreate int    // the 1-based CreateTodo call that persists, then reports a lost reply; 0 for none
+	todos           []Todo // created to-dos, in order
+	nextID          int
 
 	done     []string // ids marked done, in order
 	failDone string   // id whose DoneTodo fails; "" for none
@@ -57,11 +58,15 @@ func (f *fakeAPI) Notify(_ context.Context, n Notice) error {
 func (f *fakeAPI) CreateTodo(_ context.Context, t Todo) (string, error) {
 	f.creates++
 	if f.failCreates || f.creates == f.failCreate {
-		return "", errors.New("hub 连不上")
+		return "", &httpError{status: 400, body: "rejected"}
 	}
 	f.nextID++
 	f.todos = append(f.todos, t)
-	return fmt.Sprintf("todo-%d", f.nextID), nil
+	id := fmt.Sprintf("todo-%d", f.nextID)
+	if f.creates == f.ambiguousCreate {
+		return "", errors.New("hub 的回复丢失了")
+	}
+	return id, nil
 }
 
 func (f *fakeAPI) DoneTodo(_ context.Context, id string) error {
@@ -553,6 +558,42 @@ func TestRunTodoCreateFailureRetried(t *testing.T) {
 	}
 	if len(api.todos) != len(busyAlertKeys) {
 		t.Errorf("created %d to-dos in total, want %d", len(api.todos), len(busyAlertKeys))
+	}
+}
+
+func TestRunTodoAmbiguousCreateQuarantined(t *testing.T) {
+	ctx := context.Background()
+	api := newFake(ScopeTodos)
+	api.ambiguousCreate = 1
+	path := filepath.Join(t.TempDir(), "remind.json")
+	r := &Reminder{Hub: api, Path: path, Config: Config{Mode: "todos"}}
+	home := manyOutHome(1)
+
+	// The hub committed todo-1, but its reply was lost before the ID reached the planner.
+	if err := r.Run(ctx, home, at(9, 0), cst); err == nil {
+		t.Fatal("Run returned nil, want the ambiguous create error")
+	}
+	if err := r.Run(ctx, home, at(9, 10), cst); err != nil {
+		t.Fatal(err)
+	}
+	if api.creates != 1 || len(api.todos) != 1 {
+		t.Fatalf("automatic retry made %d calls and %d to-dos, want one of each", api.creates, len(api.todos))
+	}
+	quarantined, ok := readStateFile(t, path)["quarantined"].(map[string]any)
+	if !ok || quarantined["item:i-000"] != true {
+		t.Fatalf("quarantined = %v, want item:i-000", quarantined)
+	}
+
+	// Cleanup must not invent an ID or discard the record needed for manual reconciliation.
+	if err := r.Run(ctx, &model.Home{}, at(9, 20), cst); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.done) != 0 || len(api.todos) != 1 {
+		t.Fatalf("cleanup marked %v done with %d persisted to-dos, want no completion and one to-do", api.done, len(api.todos))
+	}
+	quarantined, ok = readStateFile(t, path)["quarantined"].(map[string]any)
+	if !ok || quarantined["item:i-000"] != true {
+		t.Fatalf("cleanup discarded the quarantine: %v", quarantined)
 	}
 }
 

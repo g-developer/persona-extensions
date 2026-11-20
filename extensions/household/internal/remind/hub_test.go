@@ -254,14 +254,17 @@ func TestCreateTodo(t *testing.T) {
 	})
 
 	tests := []struct {
-		name    string
-		status  int
-		reply   string
-		wantErr string
+		name     string
+		status   int
+		reply    string
+		wantErr  string
+		definite bool
 	}{
-		{"no id in reply", http.StatusOK, `{"todo":{}}`, "编号"},
-		{"server error", http.StatusInternalServerError, "nope", "HTTP 500"},
-		{"assistant offline", http.StatusServiceUnavailable, "offline", "HTTP 503"},
+		{"no id in reply", http.StatusOK, `{"todo":{}}`, "编号", false},
+		{"bad request is a definite rejection", http.StatusBadRequest, "bad", "HTTP 400", true},
+		{"request timeout is unknown", http.StatusRequestTimeout, "late", "HTTP 408", false},
+		{"server error", http.StatusInternalServerError, "nope", "HTTP 500", false},
+		{"assistant offline", http.StatusServiceUnavailable, "offline", "HTTP 503", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -272,6 +275,9 @@ func TestCreateTodo(t *testing.T) {
 			}
 			if id != "" {
 				t.Fatalf("id = %q on error, want empty", id)
+			}
+			if got := definiteCreateRejection(err); got != tt.definite {
+				t.Fatalf("definiteCreateRejection(error) = %v, want %v", got, tt.definite)
 			}
 		})
 	}
