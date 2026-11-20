@@ -248,7 +248,7 @@ func loadColdSessions(st *State) (archived []*SessionRecord, restored []string, 
 			if err != nil || !fi.Mode().IsRegular() || fi.Size() == 0 {
 				continue
 			}
-			files = append(files, coldFile{fileEntry{filepath.Join(dir, e.Name()), fi.ModTime()}, dir, fi.Size()})
+			files = append(files, coldFile{fileEntry{filepath.Join(dir, e.Name()), fi.ModTime(), fi.Size()}, dir, fi.Size()})
 		}
 	}
 	slices.SortFunc(files, func(a, b coldFile) int { return b.mod.Compare(a.mod) })

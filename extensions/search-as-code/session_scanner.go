@@ -10,12 +10,15 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
 
 const (
-	maxScannedSessionFiles = 80
+	// maxScannedSessionFiles is how many transcripts (newest first) a computer keeps searchable. Parsed sessions
+	// are cached by path, size and modification time (parseCache), so a search parses only what changed.
+	maxScannedSessionFiles = 1500
 	maxSessionFileBytes    = 4 << 20
 	maxRestoredExtraFiles  = 20 // restored transcripts scanned beyond the live window
 	maxScannedRepoFiles    = 200
@@ -154,6 +157,60 @@ func activeSessionDirs(st *State) []string {
 type fileEntry struct {
 	path string
 	mod  time.Time
+	size int64
+}
+
+// parseCache keeps parsed transcripts by path; an entry is reused while the file's size and modification time
+// are unchanged. Records handed out are shallow copies, so a caller may set Machine and the like; turns are
+// shared and never changed.
+var parseCache = struct {
+	sync.Mutex
+	m map[string]*cachedParse
+}{m: map[string]*cachedParse{}}
+
+type cachedParse struct {
+	size int64
+	mod  time.Time
+	rec  *SessionRecord
+	seen time.Time
+}
+
+const parseCacheIdle = 30 * time.Minute
+
+// cachedParseFile is parseSessionFile through parseCache.
+func cachedParseFile(fe fileEntry) *SessionRecord {
+	return cachedParseWith(fe, parseSessionFile)
+}
+
+func cachedParseWith(fe fileEntry, parse func(string, time.Time) *SessionRecord) *SessionRecord {
+	now := time.Now()
+	parseCache.Lock()
+	c := parseCache.m[fe.path]
+	if c != nil && c.size == fe.size && c.mod.Equal(fe.mod) {
+		c.seen = now
+		rec := c.rec
+		parseCache.Unlock()
+		return copyRecord(rec)
+	}
+	parseCache.Unlock()
+	rec := parse(fe.path, fe.mod)
+	parseCache.Lock()
+	parseCache.m[fe.path] = &cachedParse{size: fe.size, mod: fe.mod, rec: rec, seen: now}
+	for p, e := range parseCache.m {
+		if now.Sub(e.seen) > parseCacheIdle {
+			delete(parseCache.m, p)
+		}
+	}
+	parseCache.Unlock()
+	return copyRecord(rec)
+}
+
+func copyRecord(rec *SessionRecord) *SessionRecord {
+	if rec == nil {
+		return nil
+	}
+	cp := *rec
+	return &cp
 }
 
 // loadSessions scans the configured session directories and parses up to maxScannedSessionFiles recent JSONL files.
@@ -191,7 +248,7 @@ func loadSessions(st *State) ([]*SessionRecord, SourceStats) {
 			if err != nil || fi.Size() == 0 {
 				return nil
 			}
-			files = append(files, fileEntry{path: path, mod: fi.ModTime()})
+			files = append(files, fileEntry{path: path, mod: fi.ModTime(), size: fi.Size()})
 			return nil
 		})
 	}
@@ -205,10 +262,14 @@ func loadSessions(st *State) ([]*SessionRecord, SourceStats) {
 
 	var sessions []*SessionRecord
 	for _, fe := range files {
-		rec := parseSessionFile(fe.path, fe.mod)
+		rec := cachedParseFile(fe)
 		if rec == nil || len(rec.Turns) == 0 {
 			continue
 		}
+		sessions = append(sessions, rec)
+	}
+	// Other coding agents keep their history in databases and folders of their own (connectors.go).
+	for _, rec := range loadConnectorSessions(st) {
 		sessions = append(sessions, rec)
 	}
 
@@ -236,11 +297,11 @@ func loadSessions(st *State) ([]*SessionRecord, SourceStats) {
 		if err != nil || !fi.Mode().IsRegular() || fi.Size() == 0 || fi.Size() > maxSessionFileBytes || fi.ModTime().Before(windowFloor) {
 			continue
 		}
-		extra = append(extra, fileEntry{path: path, mod: fi.ModTime()})
+		extra = append(extra, fileEntry{path: path, mod: fi.ModTime(), size: fi.Size()})
 	}
 	slices.SortFunc(extra, func(a, b fileEntry) int { return b.mod.Compare(a.mod) })
 	for _, fe := range extra[:min(len(extra), maxRestoredExtraFiles)] {
-		if rec := parseSessionFile(fe.path, fe.mod); rec != nil && len(rec.Turns) > 0 && !liveIDs[rec.SessionID] {
+		if rec := cachedParseFile(fe); rec != nil && len(rec.Turns) > 0 && !liveIDs[rec.SessionID] {
 			livePaths[filepath.Clean(fe.path)] = true
 			liveIDs[rec.SessionID] = true
 			sessions = append(sessions, rec)
@@ -415,7 +476,7 @@ func extractTurnsFromObject(lineNo int, obj map[string]any, at time.Time, rec *S
 			return []SessionTurn{{
 				Line:      lineNo,
 				Role:      turnRole,
-				Text:      cleanTurnText(out),
+				Text:      cleanToolText(out),
 				ToolName:  name,
 				IsTool:    true,
 				IsError:   isErr,
@@ -449,7 +510,7 @@ func extractTurnsFromObject(lineNo int, obj map[string]any, at time.Time, rec *S
 			rec.Model = m
 		}
 		msgRole, _ := msg["role"].(string)
-		baseRole := normalizeRole(cmp.Or(msgRole, recType))
+		baseRole := normalizeRole(cmp.Or(msgRole, recType, stringVal(obj["role"])))
 		content := msg["content"]
 
 		switch c := content.(type) {
@@ -527,7 +588,7 @@ func extractTurnsFromObject(lineNo int, obj map[string]any, at time.Time, rec *S
 					})
 				case "tool_result":
 					resTxt := extractContentText(blk["content"])
-					cleaned := cleanTurnText(resTxt)
+					cleaned := cleanToolText(resTxt)
 					if cleaned == "" {
 						continue
 					}
@@ -642,6 +703,20 @@ func cleanTurnText(s string) string {
 		s = clipRunes(s, 800)
 	}
 	return s
+}
+
+// cleanToolText keeps a tool's output short: its head and its tail (where a stack trace or an exit status
+// usually is), so a computer can hold many sessions in memory.
+func cleanToolText(s string) string {
+	s = strings.TrimSpace(xmlTagNoise.ReplaceAllString(s, ""))
+	if len(s) <= 900 {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= 640 {
+		return s
+	}
+	return string(r[:280]) + " … " + string(r[len(r)-340:])
 }
 
 func isErrorTurn(text string, explicit bool) bool {

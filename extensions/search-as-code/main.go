@@ -80,6 +80,9 @@ type configSpec struct {
 	RepoDirs     string   `json:"repo_dirs"`
 	ColdTextDirs string   `json:"cold_text_dirs"`
 	DefaultScope string   `json:"default_scope"`
+	Semantic     string   `json:"semantic"`
+	EmbedURL     string   `json:"embedding_url"`
+	EmbedModel   string   `json:"embedding_model"`
 }
 
 type app struct {
@@ -93,10 +96,12 @@ type app struct {
 	// for this extension, handed to the assistant's gated command.
 	fleet         *fleet
 	hubURL, token string
+	// vec: the central vector index of all computers (semantic_service.go), nil-safe.
+	vec *vecService
 }
 
 func newApp(dir string) *app {
-	return &app{store: newStore(dir), now: time.Now}
+	return &app{store: newStore(dir), now: time.Now, vec: newVecService()}
 }
 
 func program(a *app) ext.Program {
@@ -146,6 +151,10 @@ func (a *app) init(_ context.Context, in *ext.Init, hub *ext.Hub) (map[string]an
 			if isValidScope(cfg.DefaultScope) {
 				st.DefaultScope = cfg.DefaultScope
 			}
+			st.Semantic, st.EmbedURL, st.EmbedModel = semanticOff, strings.TrimSpace(cfg.EmbedURL), strings.TrimSpace(cfg.EmbedModel)
+			if validSemantic(cfg.Semantic) {
+				st.Semantic = cfg.Semantic
+			}
 			// A restore still marked running was cut off by a restart of this extension.
 			for i := range st.Restores {
 				if st.Restores[i].Running {
@@ -164,19 +173,46 @@ func (a *app) init(_ context.Context, in *ext.Init, hub *ext.Hub) (map[string]an
 	if a.fleet != nil {
 		go a.fleet.syncLoop(a.stop)
 	}
+	if cfgErr == nil {
+		a.vec.configure(a.store.dir, cfg.Semantic, cfg.EmbedURL, cfg.EmbedModel)
+	}
+	if a.vec.index() != nil {
+		go a.vec.loop(a.stop, a.scanState, a.fleet)
+	}
 	return nil, nil
+}
+
+// scanState is what a search reads of the stored state (nil when it cannot be read).
+func (a *app) scanState() *State {
+	var st *State
+	if err := a.db().read(func(s *State) { st = s.scanState() }); err != nil {
+		return nil
+	}
+	return st
 }
 
 // execute runs prog: on this computer only, or, with other computers picked, on all of them that its machine
 // filter names.
+//
+// With vectors on, the hub first finds the semantically closest sessions of those computers in its central
+// index and hands each computer its share (vectors.go).
 func (a *app) execute(ctx context.Context, st *State, prog SearchProgram, now time.Time) *ExecutionResult {
 	a.mu.Lock()
 	f := a.fleet
 	a.mu.Unlock()
 	if !f.hasRemote() {
-		return ExecuteProgram(st, prog, now)
+		sem := a.vec.hints(ctx, st, f, prog, now, nil)
+		local := *st
+		local.semHints, local.semActive = sem.hints[""], sem.hints != nil
+		return sem.apply(ExecuteProgram(&local, prog, now))
 	}
-	return f.search(ctx, st, prog, now, filterTargets(f.targets(ctx), programMachine(prog)))
+	return a.searchTargets(ctx, f, st, prog, now, filterTargets(f.targets(ctx), programMachine(prog)))
+}
+
+// searchTargets fans prog out to targets, with the vector stage over exactly those computers.
+func (a *app) searchTargets(ctx context.Context, f *fleet, st *State, prog SearchProgram, now time.Time, targets []target) *ExecutionResult {
+	sem := a.vec.hints(ctx, st, f, prog, now, targets)
+	return sem.apply(f.searchWith(ctx, st, prog, now, targets, sem.hints))
 }
 
 func (a *app) db() *store {

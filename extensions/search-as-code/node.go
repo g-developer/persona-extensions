@@ -114,6 +114,7 @@ func (w *nodeWorker) search(p nodeSearchParams) (*ExecutionResult, error) {
 		return nil, err
 	}
 	st := w.state()
+	st.semHints, st.semActive = hintMap(p.Semantic), p.Fused
 	sessions, stats := loadSessions(st)
 	for _, s := range sessions {
 		s.Machine, s.MachineName = p.Machine, p.MachineName

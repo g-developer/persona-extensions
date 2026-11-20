@@ -2,12 +2,12 @@
   "manifest_version": 1,
   "id": "search-as-code",
   "name": "代码化搜索",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "icon": "assets/icon.png",
-  "description": "受 Perplexity「Rethinking Search as Code Generation」与 CASS 会话检索启发：把复杂的多步检索与排查任务编译为可执行的搜索代码（Search as Code），跨 Coding Agent 会话历史（Claude Code、Codex，支持排除工具噪音的纯对话检索、角色过滤与报错排查；含 disklessly 已移到云端的会话，经纯文本索引照常检索、标记「已上云」并可一键恢复到原路径）和本地代码仓库执行流水线算子（过滤、正则匹配、跨会话文件关联、聚合统计、相关性与新鲜度排序）。可选多台电脑：经 Persona 的节点把检索分发到每台电脑上执行、只回传排好序的证据片段并标明来源电脑，离线的电脑检索 hub 上已同步的轻量纯对话索引，已上云会话在所在电脑上恢复。界面透明展示生成的搜索程序与每一步算子的耗时和命中轨迹，支持保存为可复用的搜索配方。助手读其他电脑或其他项目的会话历史前先弹审批卡（写明电脑、项目与范围，可在本次对话内按目标记住）；附带本机 MCP 服务器（search-as-code mcp），列配方直接运行，检索、保存与删除配方、恢复已上云会话按对话权限询问。",
+  "description": "受 Perplexity「Rethinking Search as Code Generation」与 CASS 会话检索启发：把复杂的多步检索与排查任务编译为可执行的搜索代码（Search as Code），跨 Coding Agent 会话历史（Claude Code、Codex、Cursor 编辑器与 CLI、Antigravity、Gemini CLI，支持排除工具噪音的纯对话检索、角色过滤与报错排查；含 disklessly 已移到云端的会话，经纯文本索引照常检索、标记「已上云」并可一键恢复到原路径）和本地代码仓库执行流水线算子（过滤、正则匹配、跨会话文件关联、聚合统计、相关性与新鲜度排序），关键词相关性用 BM25（支持中文二元切分、\"短语\" 与 -排除词），本机解析结果按文件缓存，只重新解析变化的会话。可选 hub 集中向量索引：hub 统一为所有电脑的对话片段生成向量（内置特征哈希，或 hub 上的 OpenAI 兼容 embedding 端点如 Ollama），检索时把语义相近的会话交给各电脑与关键词分数融合，离线电脑同样可语义检索。可选多台电脑：经 Persona 的节点把检索分发到每台电脑上执行、只回传排好序的证据片段并标明来源电脑，离线的电脑检索 hub 上已同步的轻量纯对话索引，已上云会话在所在电脑上恢复。界面透明展示生成的搜索程序与每一步算子的耗时和命中轨迹，支持保存为可复用的搜索配方。助手读其他电脑或其他项目的会话历史前先弹审批卡（写明电脑、项目与范围，可在本次对话内按目标记住）；附带本机 MCP 服务器（search-as-code mcp），列配方直接运行，检索、保存与删除配方、恢复已上云会话按对话权限询问。",
   "publisher": "nwverse",
   "homepage": "https://github.com/nwverse/persona-extensions/blob/main/docs/extensions/search-as-code.md",
-  "tags": ["搜索", "Search as Code", "会话检索", "MCP"],
+  "tags": ["搜索", "Search as Code", "会话检索", "MCP", "向量检索"],
   "engines": {"persona": ">=202611092100", "extension_protocol": 1},
   "runtime": {
     "command": {
@@ -64,12 +64,12 @@
         "description": "选中的电脑上会装这个扩展的程序：检索时在那台电脑上读它的 Agent 会话、只把排好序的证据片段回传 hub，并定期把它的纯对话索引（只含用户与助手消息，每条截短）同步到 hub，那台电脑离线时照样能搜。不选时只检索 hub 所在的电脑。",
         "items": {"type": "string", "format": "machine", "x-os": ["darwin", "linux"]},
         "default": [],
-        "x-confirm": "这台电脑上的 Claude Code / Codex 会话历史会被检索：命中的片段和它的纯对话索引会传到 hub。助手第一次读其他电脑或其他项目的会话前会先问你（同一对话里可按电脑、项目和范围记住）。"
+        "x-confirm": "这台电脑上的 Claude Code / Codex / Cursor / Antigravity / Gemini CLI 会话历史会被检索：命中的片段和它的纯对话索引会传到 hub。助手第一次读其他电脑或其他项目的会话前会先问你（同一对话里可按电脑、项目和范围记住）。"
       },
       "session_dirs": {
         "type": "string",
         "title": "额外会话目录",
-        "description": "除默认的 ~/.claude/projects 与 ~/.codex/sessions 外，额外扫描的 Agent 会话日志目录（多个路径用逗号或分号分隔）",
+        "description": "除默认的 ~/.claude/projects 与 ~/.codex/sessions（以及自动发现的 Cursor、Antigravity、Gemini CLI 会话）外，额外扫描的 Agent 会话日志目录（多个路径用逗号或分号分隔）",
         "default": ""
       },
       "cold_text_dirs": {
@@ -82,6 +82,29 @@
         "type": "string",
         "title": "本地代码与文档目录",
         "description": "供 scan_files 算子检索的本地仓库或文档目录（多个路径用逗号或分号分隔）",
+        "default": ""
+      },
+      "semantic": {
+        "type": "string",
+        "title": "语义（向量）检索",
+        "description": "hub 集中为所有电脑的对话片段生成向量，检索时与关键词相关性融合（关键词 60% + 语义 40%）。off 只用关键词；hash 内置特征哈希向量（不联网、无需模型，只增加拼写与部分匹配的容错，不懂同义词）；endpoint 用下面 hub 上的 OpenAI 兼容 embedding 端点（推荐 Ollama 本地多语言模型如 bge-m3，可用中文问到英文会话）。",
+        "default": "off",
+        "oneOf": [
+          {"const": "off", "title": "关闭（只用关键词）"},
+          {"const": "hash", "title": "内置特征哈希（不联网）"},
+          {"const": "endpoint", "title": "embedding 端点（如 Ollama）"}
+        ]
+      },
+      "embedding_url": {
+        "type": "string",
+        "title": "embedding 端点地址",
+        "description": "semantic 为 endpoint 时，hub 调用的 OpenAI 兼容地址（POST <地址>/embeddings），如 Ollama 的 http://127.0.0.1:11434/v1。对话片段会发给这个地址，请使用 hub 本机或你自己的服务；需要密钥时在 hub 的环境变量 PERSONA_SEARCH_AS_CODE_EMBED_KEY 里设置。",
+        "default": ""
+      },
+      "embedding_model": {
+        "type": "string",
+        "title": "embedding 模型",
+        "description": "semantic 为 endpoint 时的模型名，如 bge-m3（多语言）或 nomic-embed-text。换模型后会重新生成向量。",
         "default": ""
       },
       "default_scope": {

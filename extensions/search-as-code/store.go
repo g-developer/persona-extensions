@@ -79,6 +79,17 @@ type State struct {
 	History      []RunSummary     `json:"history,omitempty"`
 	// Restores are the page's recent restores of archived sessions, newest first (at most maxRestoreNotices).
 	Restores []RestoreNotice `json:"restores,omitempty"`
+	// Semantic, EmbedURL and EmbedModel are the vector settings (embed.go), kept here so the MCP server on the
+	// hub's computer uses the hub's vector index too.
+	Semantic   string `json:"semantic,omitempty"`
+	EmbedURL   string `json:"embed_url,omitempty"`
+	EmbedModel string `json:"embed_model,omitempty"`
+
+	// semHints: the sessions of this computer the hub's vector index found for the current search, and
+	// semActive: the vector stage ran for it (hints or none), so keyword relevance takes its hybrid weight on
+	// every computer alike (not stored).
+	semHints  map[string]semHint
+	semActive bool
 }
 
 // scanState is what a search reads of the state (the directories), apart from the rest, so a search can run

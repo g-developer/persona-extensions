@@ -45,6 +45,8 @@ type EvidenceSnippet struct {
 	Role string `json:"role"` // "User", "Assistant", "Error", "Tool", "File"
 	Line int    `json:"line,omitempty"`
 	Text string `json:"text"`
+	// Semantic marks the turn the hub's vector index found closest to the query.
+	Semantic bool `json:"semantic,omitempty"`
 }
 
 // CorrelatedRef links a SearchHit to another session or file discovered via `correlate`.
@@ -114,6 +116,8 @@ type ExecutionResult struct {
 	RanAt              time.Time `json:"ran_at"`
 	// Machines is how each computer of a cross-computer search answered (empty for a search of one computer).
 	Machines []MachineRun `json:"machines,omitempty"`
+	// Semantic: the hub's vector index took part (hybrid or semantic mode with vectors on).
+	Semantic bool `json:"semantic,omitempty"`
 }
 
 // CompileInput specifies either a raw Search-as-Code program, a recipe + query override, or a natural language query.
@@ -132,6 +136,8 @@ type CompileInput struct {
 	// (routeKey) is exactly this.
 	Machine    string
 	ProjectKey string
+	// Mode is the scan_sessions search mode: hybrid (default), lexical or semantic.
+	Mode string
 }
 
 var knownOps = []string{
@@ -301,6 +307,9 @@ func validateSteps(steps []StepSpec) error {
 				if sc := s.Args["scope"]; sc != "" && !isValidScope(sc) {
 					return fmt.Errorf("第 %d 步 scan_sessions 的 scope=%q 无效", i+1, sc)
 				}
+				if m := s.Args["mode"]; m != "" && !slices.Contains(searchModes, m) {
+					return fmt.Errorf("第 %d 步 scan_sessions 的 mode=%q 无效（可用：%s）", i+1, m, strings.Join(searchModes, ", "))
+				}
 			}
 		case "match_regex":
 			pat := s.Args["pattern"]
@@ -363,6 +372,9 @@ func applyOverrides(steps []StepSpec, in CompileInput, scope string) []StepSpec 
 			if in.ProjectKey != "" {
 				args["project_key"] = in.ProjectKey
 			}
+			if m := strings.ToLower(strings.TrimSpace(in.Mode)); slices.Contains(searchModes, m) {
+				args["mode"] = m
+			}
 		}
 		if s.Op == "limit" && in.Limit > 0 {
 			args["n"] = strconv.Itoa(min(in.Limit, maxLimitCap))
@@ -379,6 +391,7 @@ func compileNaturalLanguage(in CompileInput, scope string) (SearchProgram, error
 	model := strings.TrimSpace(in.Model)
 	since := strings.TrimSpace(in.Since)
 	machine := strings.TrimSpace(in.Machine)
+	mode := strings.ToLower(strings.TrimSpace(in.Mode))
 	regexPat := ""
 	groupField := "project"
 	correlateBy := "file"
@@ -417,6 +430,11 @@ func compileNaturalLanguage(in CompileInput, scope string) (SearchProgram, error
 			case "machine", "host", "computer":
 				machine = v
 				continue
+			case "mode":
+				if slices.Contains(searchModes, strings.ToLower(v)) {
+					mode = strings.ToLower(v)
+					continue
+				}
 			case "regex", "re":
 				regexPat = v
 				continue
@@ -471,6 +489,9 @@ func compileNaturalLanguage(in CompileInput, scope string) (SearchProgram, error
 	}
 	if in.ProjectKey != "" {
 		scanArgs["project_key"] = in.ProjectKey
+	}
+	if slices.Contains(searchModes, mode) && mode != modeHybrid {
+		scanArgs["mode"] = mode
 	}
 
 	steps := []StepSpec{{Op: "scan_sessions", Args: scanArgs}}
@@ -617,7 +638,7 @@ func executeSessions(st *State, sessions []*SessionRecord, stats SourceStats, pr
 
 		switch step.Op {
 		case "scan_sessions":
-			hits := evalScanSessions(sessions, step.Args, now)
+			hits := evalScanSessions(st, sessions, step.Args, now)
 			working = append(working, hits...)
 			q := step.Args["query"]
 			sc := cmp.Or(step.Args["scope"], "conversation")
@@ -725,7 +746,7 @@ func pinnedProjectKey(prog SearchProgram) string {
 	return ""
 }
 
-func evalScanSessions(sessions []*SessionRecord, args map[string]string, now time.Time) []*SearchHit {
+func evalScanSessions(st *State, sessions []*SessionRecord, args map[string]string, now time.Time) []*SearchHit {
 	query := strings.TrimSpace(args["query"])
 	scope := cmp.Or(strings.TrimSpace(args["scope"]), "conversation")
 	project := strings.ToLower(strings.TrimSpace(args["project"]))
@@ -738,9 +759,24 @@ func evalScanSessions(sessions []*SessionRecord, args map[string]string, now tim
 		pinnedProjects = projectsForKey(sessions, pinned)
 	}
 	sinceTime := parseSince(args["since"], now)
-	terms := splitQueryTerms(query)
+	q := parseQueryTerms(query)
+	mode := searchMode(args["mode"])
+	var hints map[string]semHint
+	fused := st != nil && (st.semActive || st.semHints != nil) && mode != modeLexical && !q.empty()
+	if fused {
+		hints = st.semHints
+	} else if mode == modeSemantic {
+		mode = modeLexical // no vectors for this search: keyword relevance only
+	}
 
-	var hits []*SearchHit
+	// Pass 1: the sessions the filters keep, and the term statistics of their turns in scope.
+	type cand struct {
+		s    *SessionRecord
+		docs []lexDoc
+		idx  []int // turn index of each doc
+	}
+	var cands []cand
+	corpus := newLexCorpus(q)
 	for _, s := range sessions {
 		if project != "" && !strings.Contains(strings.ToLower(s.Project), project) && !strings.Contains(strings.ToLower(s.CWD), project) {
 			continue
@@ -763,49 +799,127 @@ func evalScanSessions(sessions []*SessionRecord, args map[string]string, now tim
 		if scope == "errors" && s.ErrorCount == 0 {
 			continue
 		}
+		c := cand{s: s}
+		if !q.empty() {
+			for i, tr := range s.Turns {
+				if turnFitsScope(tr, scope) {
+					c.docs = append(c.docs, corpus.observe(tr.Text))
+					c.idx = append(c.idx, i)
+				}
+			}
+		}
+		cands = append(cands, c)
+	}
+	corpus.finish()
 
+	// Pass 2: score each session from its best turns, fused with the semantic similarity the hub found for it.
+	var hits []*SearchHit
+	for _, c := range cands {
+		s := c.s
 		var snippets []EvidenceSnippet
 		score := 0.0
 		firstErrKind := ""
-
-		titleMatched := len(terms) > 0 && matchesAnyTerm(s.Title+" "+s.Project+" "+s.Branch, terms)
-		if titleMatched {
-			score += 4.0
+		for _, tr := range s.Turns {
+			if tr.IsError && turnFitsScope(tr, scope) {
+				firstErrKind = tr.ErrorKind
+				break
+			}
 		}
 
-		for _, tr := range s.Turns {
-			if !turnFitsScope(tr, scope) {
-				continue
-			}
-			if tr.IsError && firstErrKind == "" {
-				firstErrKind = tr.ErrorKind
-			}
-			if len(terms) == 0 {
+		if slices.ContainsFunc(c.docs, func(d lexDoc) bool { return d.neg }) {
+			continue // a -term leaves out every session that mentions it
+		}
+		if q.empty() {
+			n := 0
+			for _, tr := range s.Turns {
+				if !turnFitsScope(tr, scope) {
+					continue
+				}
+				n++
 				if len(snippets) < 3 {
 					snippets = append(snippets, toSnippet(tr))
 				}
-				score += 1.0
-				continue
 			}
-			termHits := countTermMatches(tr.Text, terms)
-			if termHits > 0 {
-				weight := float64(termHits) * 2.5
+			score = float64(min(n, 12)) * 0.5
+		} else {
+			type scored struct {
+				i     int
+				score float64
+			}
+			var best []scored
+			for j, d := range c.docs {
+				sc, n := corpus.score(d)
+				if n == 0 {
+					continue
+				}
+				tr := s.Turns[c.idx[j]]
 				if !tr.IsTool {
-					weight *= 1.4
+					sc *= 1.15 // a user or assistant turn says more than a tool's output
 				}
 				if tr.IsError {
-					weight += 2.0
+					sc += 0.05
 				}
-				score += weight
-				if len(snippets) < 4 {
-					snippets = append(snippets, toSnippet(tr))
+				best = append(best, scored{c.idx[j], sc})
+			}
+			slices.SortStableFunc(best, func(a, b scored) int { return cmp.Compare(b.score, a.score) })
+			lex := 0.0
+			for k, b := range best[:min(len(best), 3)] {
+				lex += b.score * []float64{1, 0.2, 0.1}[k]
+			}
+			title := corpus.titleScore(s.Title + " " + s.Project + " " + s.Branch)
+			if lex == 0 && title > 0 {
+				lex = 0.5 * title
+			} else {
+				lex += 0.25 * title
+			}
+			lex = min(lex, 1.2)
+
+			sem, hasSem := hints[s.SessionID]
+			rel := lex
+			switch {
+			case mode == modeSemantic:
+				if !hasSem {
+					continue
 				}
+				rel = sem.Sim
+			case hasSem:
+				rel = lexWeight*lex + semWeight*sem.Sim
+			case fused:
+				rel = lexWeight * lex
+			}
+			if rel <= 0 || (lex == 0 && !hasSem) {
+				continue
+			}
+			score = 10 * rel
+
+			lines := map[int]bool{}
+			if hasSem && sem.Line > 0 {
+				for _, tr := range s.Turns {
+					if tr.Line == sem.Line && turnFitsScope(tr, scope) {
+						sn := toSnippet(tr)
+						sn.Semantic = true
+						snippets = append(snippets, sn)
+						lines[tr.Line] = true
+						break
+					}
+				}
+			}
+			// The best turns, shown in the order of the conversation (after the closest exchange, if any).
+			var picked []int
+			for _, b := range best {
+				if len(snippets)+len(picked) >= 4 {
+					break
+				}
+				if !lines[s.Turns[b.i].Line] {
+					picked = append(picked, b.i)
+				}
+			}
+			slices.Sort(picked)
+			for _, i := range picked {
+				snippets = append(snippets, toSnippet(s.Turns[i]))
 			}
 		}
 
-		if len(terms) > 0 && len(snippets) == 0 && !titleMatched {
-			continue
-		}
 		if len(snippets) == 0 {
 			for _, tr := range s.Turns {
 				if turnFitsScope(tr, scope) {

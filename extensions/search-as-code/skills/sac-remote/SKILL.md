@@ -1,6 +1,6 @@
 ---
 name: sac-remote
-description: 用 sac 命令跨电脑、跨项目检索用户的 Coding Agent 会话历史（Claude Code、Codex，含 disklessly 已上云的会话）：Persona 把检索分发到用户的每台电脑上执行，只回传排好序的证据片段，并标明来自哪台电脑；离线的电脑检索 hub 上已同步的纯对话索引。用户问「我在另一台电脑上是怎么修的」「之前在某个项目里讨论过什么」「所有电脑上最近的报错」时用。第一次读某台电脑、某个项目的会话会先弹审批卡，要用户批准。
+description: 用 sac 命令跨电脑、跨项目检索用户的 Coding Agent 会话历史（Claude Code、Codex、Cursor、Antigravity、Gemini CLI，含 disklessly 已上云的会话）：Persona 把检索分发到用户的每台电脑上执行，只回传排好序的证据片段，并标明来自哪台电脑；离线的电脑检索 hub 上已同步的纯对话索引。用户问「我在另一台电脑上是怎么修的」「之前在某个项目里讨论过什么」「所有电脑上最近的报错」时用。第一次读某台电脑、某个项目的会话会先弹审批卡，要用户批准。
 ---
 
 # 跨电脑、跨项目检索会话历史（sac 命令）
@@ -20,7 +20,7 @@ description: 用 sac 命令跨电脑、跨项目检索用户的 Coding Agent 会
 1. 先 `sac GET /machines` 拿到电脑的 `key`：`hub` 是 hub 所在的电脑，`all` 是全部电脑；其他电脑的 key 只含小写字母和 `-`（由名字转成，数字被编码，别自己拼，照抄返回的 key）。要按项目检索时，用 `sac GET /projects/<电脑 key>` 找到项目的 `key`；不限项目用 `all`。
 2. 路径的三段就是用户要批准的目标：电脑、项目、范围（`conversation` 纯对话不含工具噪音，默认用它；`all` 含工具调用与输出；`user` 仅用户；`assistant` 仅助手；`errors` 报错与异常）。尽量窄：知道是哪台电脑、哪个项目，就不要用 `all`。范围用 `conversation` 能满足就不要用 `all`——工具输出里更容易有日志和凭据。
 3. 查询参数：
-   - `q`：自然语言或关键词，支持内联算子 `harness:codex`、`model:...`、`since:7d`、`regex:...`、`group:machine`；
+   - `q`：自然语言或关键词，支持内联算子 `harness:codex`（或 `cursor`、`cursor-cli`、`antigravity`、`gemini-cli`）、`model:...`、`since:7d`、`regex:...`、`group:machine`、`mode:lexical|semantic`，`"短语"` 与 `-排除词`；hub 开启向量时默认把语义相近的会话一起找回，命中片段标 `semantic`；
    - `code`：一段 Search-as-Code 流水线（`scan_sessions(...) |> exclude_tools() |> correlate(by="file") |> group_by(field="machine") |> rank(...) |> limit(n=20)`）；
    - `recipe`：配方 id（见 `/recipes`），`since`、`harness`、`model`、`limit`（默认 25，最多 100）。
    路径上的电脑、项目和范围总是生效：`code` 或 `q` 里写的范围、项目不能扩大它。

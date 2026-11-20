@@ -43,6 +43,7 @@ type draw struct {
 	loc   *time.Location
 	fleet *fleet // nil: no other computers
 	ctx   context.Context
+	vec   *vectorIndex // nil: vectors off
 }
 
 func (a *app) render(ctx context.Context, r *ext.UIRequest) (*wire.View, error) {
@@ -71,7 +72,7 @@ func (a *app) drawer(ctx context.Context, st *State, r *ext.UIRequest) draw {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return draw{st: st, now: a.now(), loc: loc, fleet: f, ctx: ctx}
+	return draw{st: st, now: a.now(), loc: loc, fleet: f, ctx: ctx, vec: a.vec.index()}
 }
 
 func (d draw) activeExecution(p page) *ExecutionResult {
@@ -337,6 +338,9 @@ func (d draw) resultsSections(p page, res *ExecutionResult, recipes []*Recipe) [
 		hitSec.Items = append(hitSec.Items, row)
 		for j, sn := range h.Snippets[:min(len(h.Snippets), 2)] {
 			prefix := fmt.Sprintf("[%s", sn.Role)
+			if sn.Semantic {
+				prefix += " · 语义"
+			}
 			if sn.Line > 0 {
 				prefix += fmt.Sprintf(" L%d", sn.Line)
 			}
@@ -558,6 +562,16 @@ func (d draw) sourcesSections(p page) []wire.Section {
 			Badge:    &wire.Badge{Text: "CASS 扫描源"},
 		})
 	}
+	for i, src := range connectorSources() {
+		overview.Items = append(overview.Items, wire.Component{
+			Type:     wire.ComponentRow,
+			Key:      fmt.Sprintf("conn-%d", i),
+			Icon:     "folder",
+			Title:    shortenHome(src),
+			Subtitle: "Cursor / Antigravity / Gemini CLI 会话（只读）",
+			Badge:    &wire.Badge{Text: "连接器"},
+		})
+	}
 	for i, dir := range stats.ColdTextDirs {
 		overview.Items = append(overview.Items, wire.Component{
 			Type:     wire.ComponentRow,
@@ -601,6 +615,26 @@ func (d draw) sourcesSections(p page) []wire.Section {
 	if d.fleet != nil {
 		secs = append(secs, d.machinesSection())
 	}
+	if d.vec != nil {
+		vs := d.vec.stats()
+		sec := wire.Section{
+			Title:  "hub 集中向量索引",
+			Footer: "检索时 hub 把查询向量化一次，在所有电脑的对话片段里找语义相近的会话，交给各电脑与关键词分数融合（关键词 60% + 语义 40%）。",
+			Items: []wire.Component{{Type: wire.ComponentStatGrid, Key: "vec-stats", Stats: []wire.Stat{
+				{Label: "向量模型", Value: embedderLabel(d.vec.emb)},
+				{Label: "会话", Value: strconv.Itoa(vs.Sessions)},
+				{Label: "对话片段", Value: strconv.Itoa(vs.Chunks)},
+				{Label: "电脑", Value: strconv.Itoa(vs.Machines)},
+			}}},
+		}
+		if !vs.BuiltAt.IsZero() {
+			sec.Items = append(sec.Items, wire.Component{Type: wire.ComponentText, Key: "vec-built", Style: wire.TextStyleSecondary, Text: "更新于 " + d.formatTime(vs.BuiltAt)})
+		}
+		if vs.Error != "" {
+			sec.Items = append(sec.Items, wire.Component{Type: wire.ComponentText, Key: "vec-err", Style: wire.TextStyleSecondary, Text: "向量化出错：" + vs.Error})
+		}
+		secs = append(secs, sec)
+	}
 	if len(distRows) > 0 {
 		secs = append(secs, wire.Section{
 			Title: "Harness / 模型 / 项目分布",
@@ -615,7 +649,7 @@ func (d draw) sourcesSections(p page) []wire.Section {
 
 	cfgSec := wire.Section{
 		Title:  "配置检索目录",
-		Footer: "默认自动扫描 ~/.claude/projects、~/.codex/sessions 与 disklessly 的已上云会话索引（<状态目录>/sessions/text）；你可以在此附加自定义会话目录、索引目录或本地代码仓库目录。",
+		Footer: "默认自动扫描 ~/.claude/projects、~/.codex/sessions、Cursor（编辑器与 CLI）、Antigravity、Gemini CLI 的会话与 disklessly 的已上云会话索引（<状态目录>/sessions/text）；你可以在此附加自定义会话目录、索引目录或本地代码仓库目录。",
 		Items: []wire.Component{
 			{
 				Type:        wire.ComponentField,
@@ -802,7 +836,7 @@ func (d draw) hitDetailView(p page) *wire.View {
 				Type:     wire.ComponentRow,
 				Key:      fmt.Sprintf("det-snip-%d", i),
 				Icon:     roleIcon(sn.Role),
-				Title:    fmt.Sprintf("%s · 第 %d 行", sn.Role, max(sn.Line, 1)),
+				Title:    fmt.Sprintf("%s · 第 %d 行%s", sn.Role, max(sn.Line, 1), map[bool]string{true: " · 语义最接近"}[sn.Semantic]),
 				Subtitle: sn.Text,
 			})
 		}

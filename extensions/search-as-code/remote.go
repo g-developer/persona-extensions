@@ -36,10 +36,10 @@ const (
 	machinesTTL        = 30 * time.Second
 
 	// The synced index of a computer: its newest sessions, their user / assistant turns only, each clipped.
-	maxCachedSessions  = 300
+	maxCachedSessions  = 1000
 	maxCachedTurns     = 80
-	maxCachedTurnRunes = 280
-	indexPageSessions  = 60
+	maxCachedTurnRunes = 400
+	indexPageSessions  = 40
 	maxIndexPages      = 10
 
 	// maxKeyLen keeps a route key a single path segment the assistant's gate remembers as it is: the gate turns a
@@ -462,6 +462,11 @@ type nodeSearchParams struct {
 	Program     SearchProgram `json:"program"`
 	Machine     string        `json:"machine"`
 	MachineName string        `json:"machine_name"`
+	// Semantic: this computer's sessions the hub's vector index found close to the query, fused with keyword
+	// relevance there (a program of an earlier version ignores it and searches by keywords only).
+	Semantic []semHint `json:"semantic,omitempty"`
+	// Fused: the vector stage ran for this search (Semantic may be empty for this computer).
+	Fused bool `json:"fused,omitempty"`
 }
 
 type part struct {
@@ -508,6 +513,11 @@ func withLimit(prog SearchProgram, n int) SearchProgram {
 // result's limit, and what one answers is cut to it as well, so a response, the merged result and the run the
 // page keeps stay as large as a single computer's.
 func (f *fleet) search(ctx context.Context, st *State, prog SearchProgram, now time.Time, targets []target) *ExecutionResult {
+	return f.searchWith(ctx, st, prog, now, targets, nil)
+}
+
+// searchWith is search with the sessions the hub's vector index found, per computer ("" the hub's own).
+func (f *fleet) searchWith(ctx context.Context, st *State, prog SearchProgram, now time.Time, targets []target, hints map[string]map[string]semHint) *ExecutionResult {
 	start := time.Now()
 	limit := programLimit(prog)
 	sent := withLimit(prog, limit)
@@ -517,7 +527,7 @@ func (f *fleet) search(ctx context.Context, st *State, prog SearchProgram, now t
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			p := f.searchOne(ctx, st, sent, now, t)
+			p := f.searchOne(ctx, st, sent, now, t, hints)
 			if p.res != nil && len(p.res.Hits) > limit {
 				p.res.Hits = p.res.Hits[:limit]
 			}
@@ -530,7 +540,7 @@ func (f *fleet) search(ctx context.Context, st *State, prog SearchProgram, now t
 	return res
 }
 
-func (f *fleet) searchOne(ctx context.Context, st *State, prog SearchProgram, now time.Time, t target) part {
+func (f *fleet) searchOne(ctx context.Context, st *State, prog SearchProgram, now time.Time, t target, hints map[string]map[string]semHint) part {
 	start := time.Now()
 	p := part{t: t, run: MachineRun{ID: t.ID, Name: t.Name, Key: t.Key}}
 	defer func() { p.run.DurationMs = max(time.Since(start).Milliseconds(), 0) }()
@@ -538,7 +548,9 @@ func (f *fleet) searchOne(ctx context.Context, st *State, prog SearchProgram, no
 		if m := programMachine(prog); t.AliasID != "" && m != "" && machineMatches(m, t.AliasID, t.AliasName) {
 			prog = retargetMachine(prog, hubMachineKey) // its sessions carry no machine id: name them as the hub's
 		}
-		p.res, p.run.Status = ExecuteProgram(st, prog, now), machineLocal
+		local := *st
+		local.semHints, local.semActive = hints[""], hints != nil
+		p.res, p.run.Status = ExecuteProgram(&local, prog, now), machineLocal
 		if t.AliasID != "" {
 			for _, h := range p.res.Hits {
 				h.MachineName = t.Name // shown as the hub lists it; the id stays empty (the hub's own computer)
@@ -550,7 +562,11 @@ func (f *fleet) searchOne(ctx context.Context, st *State, prog SearchProgram, no
 	if t.Online && f.nodes != nil {
 		cctx, cancel := context.WithTimeout(ctx, nodeSearchTimeout)
 		var res ExecutionResult
-		err := f.nodes.Call(cctx, t.ID, "sac.search", nodeSearchParams{Program: prog, Machine: t.ID, MachineName: t.Name}, &res)
+		params := nodeSearchParams{Program: prog, Machine: t.ID, MachineName: t.Name}
+		if hints != nil {
+			params.Semantic, params.Fused = hintList(hints[t.ID]), true
+		}
+		err := f.nodes.Call(cctx, t.ID, "sac.search", params, &res)
 		cancel()
 		if err == nil {
 			tagHits(res.Hits, t, false)
@@ -570,7 +586,7 @@ func (f *fleet) searchOne(ctx context.Context, st *State, prog SearchProgram, no
 		cp.Machine, cp.MachineName = t.ID, t.Name
 		sessions[i] = &cp
 	}
-	res := executeSessions(&State{}, sessions, statsOf(sessions), prog, now)
+	res := executeSessions(&State{semHints: hints[t.ID], semActive: hints != nil}, sessions, statsOf(sessions), prog, now)
 	tagHits(res.Hits, t, true)
 	p.res, p.run.Status, p.run.SyncedAt = res, machineCached, c.SyncedAt
 	p.run.Note = note + "，检索已同步的索引"

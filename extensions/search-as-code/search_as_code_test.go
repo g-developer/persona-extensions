@@ -28,6 +28,7 @@ func TestMain(m *testing.M) {
 	locatorFile = func() string { return filepath.Join(dir, "data-dir") }
 	defaultSessionDirs = func() []string { return nil }
 	defaultColdTextDirs = func() []string { return nil }
+	connectorHome = func() string { return "" }
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)

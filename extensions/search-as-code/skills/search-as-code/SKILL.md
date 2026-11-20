@@ -1,6 +1,6 @@
 ---
 name: search-as-code
-description: 用户的代码化搜索（Search as Code）与本机 Coding Agent 会话深度检索（经本机 search-as-code MCP 服务器）：把复杂的多步检索、跨会话溯源、报错排查或模块决策回溯编译为可执行的搜索流水线代码（|> 算子链），跨 Claude Code / Codex 会话历史（支持排除工具调用噪音的纯对话检索；含 disklessly 已移到云端、标记为「已上云」的会话）与本地代码库执行过滤、正则匹配、跨文件关联、聚合与排序。列配方（mcp__search-as-code__sac_recipes_list）直接运行；检索会话（sac_execute / sac_session_search，会读本机所有项目的会话历史）、保存或删除搜索配方（sac_recipe_upsert / sac_recipe_delete）与恢复已上云会话（sac_session_restore）按对话权限先请用户确认。其他电脑上的会话用 sac 命令检索（见 sac-remote）。
+description: 用户的代码化搜索（Search as Code）与本机 Coding Agent 会话深度检索（经本机 search-as-code MCP 服务器）：把复杂的多步检索、跨会话溯源、报错排查或模块决策回溯编译为可执行的搜索流水线代码（|> 算子链），跨 Claude Code / Codex / Cursor / Antigravity / Gemini CLI 会话历史（支持排除工具调用噪音的纯对话检索；含 disklessly 已移到云端、标记为「已上云」的会话）与本地代码库执行过滤、正则匹配、跨文件关联、聚合与排序。列配方（mcp__search-as-code__sac_recipes_list）直接运行；检索会话（sac_execute / sac_session_search，会读本机所有项目的会话历史）、保存或删除搜索配方（sac_recipe_upsert / sac_recipe_delete）与恢复已上云会话（sac_session_restore）按对话权限先请用户确认。其他电脑上的会话用 sac 命令检索（见 sac-remote）。
 ---
 
 # 代码化搜索（mcp__search-as-code__* 工具）
@@ -11,7 +11,10 @@ description: 用户的代码化搜索（Search as Code）与本机 Coding Agent 
 
 流水线步骤用 `|>` 串联：
 
-1. `scan_sessions(query="", scope="conversation", project="", harness="", model="", since="")`：
+1. `scan_sessions(query="", scope="conversation", project="", harness="", model="", since="", mode="hybrid")`：
+   - `query` 用 BM25 打分：中文连续文字按二元切分（`数据库超时` 也能命中 `数据库连接超时`），`"exit status 2"` 是整个短语，`-flaky` 排除提到它的会话；
+   - `harness`：`claude-code`、`codex`、`cursor`（编辑器与 agent）、`cursor-cli`、`antigravity`、`gemini-cli`；
+   - `mode`：`hybrid`（默认：hub 开启向量时，关键词 60% + hub 集中向量语义 40% 融合；未开启时等同 `lexical`）、`lexical` 只用关键词、`semantic` 只用向量相似度。语义找到的片段带 `semantic: true`，排在该会话片段的第一条；
    - `scope` 支持：
      - `conversation`（默认，**Without tools 降噪模式**）：仅检索 `User` 与 `Assistant` 对话正文，剥离冗长的 `tool_use` / `tool_result` JSON 噪音；
      - `all`：包含所有对话与工具输入输出；
@@ -40,6 +43,11 @@ description: 用户的代码化搜索（Search as Code）与本机 Coding Agent 
 3. **快速 CASS 会话检索**：调用 `sac_session_search {query, scope, project?, harness?, model?, since?, exclude_tools?}`。
 4. **已上云会话**：disklessly 移到云端的会话仍可检索（本机保存了只含用户与助手消息的纯文本索引），命中结果的 `location` 为 `已上云`，并带 `entry_id` 与 `original_path`；本机原文件的命中为 `本地`。`location` 为 `未确认上云` 的命中来自上传未完成的索引，云端未必有副本，不要主动恢复。用户要继续某个已上云会话时，先告诉用户会恢复到哪个原路径，确认后调用 `sac_session_restore {entry_id}`（最长约 5 分钟），成功后把返回的 `resume` 命令（如 `claude --resume <id>`，其他工具可能没有）告诉用户；报「正在恢复中」时说明已有恢复在进行；报「云端不可达」时请用户稍后再试。
 5. **沉淀常用搜索配方**：当某段 Search-as-Code 流水线值得长期复用时，先向用户展示流水线代码与名称，用户同意后调用 `sac_recipe_upsert` 保存；删除自定义配方前先和用户确认，再调用 `sac_recipe_delete`。
+
+## 关键词还是语义
+
+- 报错信息、函数名、文件名、ID 这类精确字符串用关键词（`mode="lexical"` 或 `regex:`）最准；
+- 换了说法、用中文问英文会话、只记得大意时，保持默认 `hybrid`（需要用户在设置里开启「语义（向量）检索」；`step_traces` 第一步是 `vector_search` 说明向量参与了，备注里写了失败原因时本次只用了关键词）。
 
 ## 汇报结果时的原则
 

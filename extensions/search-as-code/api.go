@@ -161,7 +161,7 @@ func (a *app) apiSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The route's computers, as approved: the program's own machine filters were dropped by pinProgram.
-	res := f.search(r.Context(), scan, prog, a.now(), targets)
+	res := a.searchTargets(r.Context(), f, scan, prog, a.now(), targets)
 	_ = a.db().update(func(st *State, now time.Time) error {
 		st.recordRun(res, now)
 		return nil

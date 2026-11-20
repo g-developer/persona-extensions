@@ -20,7 +20,10 @@ import (
 
 const mcpProtocol = "2025-06-18"
 
-type mcpServer struct{ store *store }
+type mcpServer struct {
+	store *store
+	vec   *vecService // the hub's vector index, read-only here (the hub's extension keeps it fresh)
+}
 
 type tool struct {
 	name, description string
@@ -42,8 +45,9 @@ var tools = []tool{
 			"code":    str("显式的 Search-as-Code 流水线代码，例如 scan_sessions(query=\"quota\", scope=\"conversation\") |> exclude_tools() |> correlate(by=\"file\") |> group_by(field=\"project\") |> rank(by=\"relevance_freshness\") |> limit(n=20)"),
 			"recipe":  str("要执行的搜索配方 ID（见 sac_recipes_list，如 error-triage、cross-session-context、model-harness-audit）"),
 			"scope":   map[string]any{"type": "string", "enum": scopes, "description": "检索范围：conversation 纯对话不含工具噪音（默认）、all 全部、user 仅用户提问、assistant 仅助手回复、errors 报错与异常"},
+			"mode":    map[string]any{"type": "string", "enum": searchModes, "description": "hybrid（默认：关键词 + hub 集中向量语义融合，未开启向量时等同 lexical）、lexical 只用关键词、semantic 只用向量相似度"},
 			"project": str("按项目名称或工作目录过滤"),
-			"harness": str("按 Agent Harness 过滤（如 claude-code、codex）"),
+			"harness": str("按 Agent Harness 过滤（claude-code、codex、cursor、cursor-cli、antigravity、gemini-cli）"),
 			"model":   str("按模型过滤（如 claude-sonnet-5-5、claude-opus-5-5、gpt-5-codex）"),
 			"since":   str("时间窗口（如 7d、24h 或 YYYY-MM-DD）"),
 			"limit":   map[string]any{"type": "integer", "minimum": 1, "maximum": 100, "description": "返回最大条数，默认 25"},
@@ -57,7 +61,8 @@ var tools = []tool{
 			"query":         str("检索关键词或短语"),
 			"scope":         map[string]any{"type": "string", "enum": scopes, "description": "CASS 风格范围过滤：conversation 纯对话（自动排除工具调用噪音）、all 全部、user 仅用户、assistant 仅助手、errors 仅报错与异常"},
 			"project":       str("只看指定项目"),
-			"harness":       str("只看指定 Harness（claude-code / codex）"),
+			"harness":       str("只看指定 Harness（claude-code / codex / cursor / cursor-cli / antigravity / gemini-cli）"),
+			"mode":          map[string]any{"type": "string", "enum": searchModes, "description": "hybrid（默认）、lexical、semantic"},
 			"model":         str("只看指定模型"),
 			"since":         str("起始时间（如 7d、48h 或 YYYY-MM-DD）"),
 			"exclude_tools": map[string]any{"type": "boolean", "description": "是否剥离 tool_use / tool_result 噪音（默认在 conversation 范围下为 true）"},
@@ -247,6 +252,7 @@ func (m *mcpServer) call(name string, args map[string]any) (any, error) {
 			prog, err := CompileProgram(CompileInput{
 				Query:   strArg("query"),
 				Code:    strArg("code"),
+				Mode:    strArg("mode"),
 				Recipe:  rec,
 				Scope:   cmp.Or(strArg("scope"), st.DefaultScope),
 				Project: strArg("project"),
@@ -258,7 +264,7 @@ func (m *mcpServer) call(name string, args map[string]any) (any, error) {
 			if err != nil {
 				return err
 			}
-			res := ExecuteProgram(st, prog, now)
+			res := m.run(st, prog, now)
 			st.recordRun(res, now)
 			out = res
 			return nil
@@ -280,12 +286,13 @@ func (m *mcpServer) call(name string, args map[string]any) (any, error) {
 				Model:        strArg("model"),
 				Since:        strArg("since"),
 				ExcludeTools: excl,
+				Mode:         strArg("mode"),
 				Limit:        intArg("limit", defaultLim),
 			})
 			if err != nil {
 				return err
 			}
-			res := ExecuteProgram(st, prog, now)
+			res := m.run(st, prog, now)
 			st.recordRun(res, now)
 			out = res
 			return nil
@@ -331,4 +338,18 @@ func (m *mcpServer) call(name string, args map[string]any) (any, error) {
 	default:
 		return nil, fmt.Errorf("unknown tool %q", name)
 	}
+}
+
+// run executes prog on this computer, with the hub's vector index when the settings turn vectors on and the
+// index is in this data directory (the MCP server on the hub's computer).
+func (m *mcpServer) run(st *State, prog SearchProgram, now time.Time) *ExecutionResult {
+	if m.vec == nil {
+		m.vec = newVecService()
+		m.vec.readOnly = true
+	}
+	m.vec.configure(m.store.dir, st.Semantic, st.EmbedURL, st.EmbedModel)
+	sem := m.vec.hints(context.Background(), st, nil, prog, now, nil)
+	local := *st
+	local.semHints, local.semActive = sem.hints[""], sem.hints != nil
+	return sem.apply(ExecuteProgram(&local, prog, now))
 }
