@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"slices"
 	"strings"
 	"testing"
@@ -92,6 +93,147 @@ func TestOverviewReadsAXiaomiHome(t *testing.T) {
 	// the room's own page lists the remote too
 	_, room := renderV(t, a, 6, pageState{Area: "ke_ting"})
 	contains(t, room, "tile 空调|遥控 · ", "tile 灯光1|另有 1 项|")
+}
+
+// An IR remote with both power buttons has a switch on its tile (#774): on when 开机 was pressed after 关机, turning it
+// on and off pressing them, and nothing but that remote's own power buttons.
+func TestRemoteTileSwitch(t *testing.T) {
+	const (
+		tvOn   = "button.tv_turn_on"
+		tvOff  = "button.tv_turn_off"
+		tvUp   = "button.tv_volume_up"
+		fanOn  = "button.fan_turn_on" // a remote with one power button: no switch
+		fanSpd = "button.fan_speed"
+	)
+	at := func(ago time.Duration) string { return time.Now().Add(-ago).UTC().Format(time.RFC3339Nano) }
+	r := newRichHA(t)
+	put := func(on, off string) {
+		r.put(State{EntityID: tvOn, State: on, Attributes: map[string]any{"friendly_name": "电视 红外电视控制 开机"}},
+			State{EntityID: tvOff, State: off, Attributes: map[string]any{"friendly_name": "电视 红外电视控制 关机"}})
+	}
+	put("unknown", "unknown")
+	r.put(State{EntityID: tvUp, State: "unknown", Attributes: map[string]any{"friendly_name": "电视 红外电视控制 音量+"}},
+		State{EntityID: fanOn, State: "unknown", Attributes: map[string]any{"friendly_name": "风扇 红外风扇控制 开机"}},
+		State{EntityID: fanSpd, State: "unknown", Attributes: map[string]any{"friendly_name": "风扇 红外风扇控制 风速"}})
+	for _, e := range []struct{ id, dev string }{{tvOn, "tv"}, {tvOff, "tv"}, {tvUp, "tv"}, {fanOn, "fan"}, {fanSpd, "fan"}} {
+		r.ws.entities = append(r.ws.entities, map[string]any{"entity_id": e.id, "device_id": e.dev, "platform": "xiaomi_home"})
+	}
+	r.ws.devices = append(r.ws.devices, map[string]any{"id": "tv", "name": "电视"}, map[string]any{"id": "fan", "name": "风扇"})
+	r.services = strings.TrimSuffix(r.services, "]") + `,{"domain":"button","services":{"press":{}}}]`
+	r.areas = areasJSON([][3]any{{"ke_ting", "客厅", []string{tvOn, tvOff, tvUp, fanOn, fanSpd}}})
+	a := richApp(t, r, Config{})
+	a.marks.load(a.dataDir, t.Logf)
+
+	tile := func() map[string]wire.Tile {
+		t.Helper()
+		h, _, _ := a.client()
+		h.mu.Lock()
+		h.statesAt = time.Time{} // read the buttons' new times
+		h.mu.Unlock()
+		v, _ := renderV(t, a, 6, nil)
+		out := map[string]wire.Tile{}
+		for _, x := range tilesOf(v, "room:ke_ting") {
+			out[x.Title] = x
+		}
+		return out
+	}
+	sw := func(want string) {
+		t.Helper()
+		tv, ok := tile()["电视"]
+		if !ok || tv.Control == nil {
+			t.Fatalf("the TV's tile has no switch: %+v", tv)
+		}
+		if got := controlText(tv.Control); got != want {
+			t.Errorf("switch %s, want %s", got, want)
+		}
+	}
+	off, on := "ctl(switch ir:"+tvOn+" false →ctl:ir "+tvOn+")", "ctl(switch ir:"+tvOn+" true →ctl:ir "+tvOn+")"
+	sw(off) // never pressed
+	put(at(time.Minute), at(time.Hour))
+	sw(on) // 开机 after 关机
+	put(at(time.Hour), at(time.Minute))
+	sw(off) // 关机 after 开机
+	put(at(time.Minute), "unknown")
+	sw(on) // 开机, 关机 never
+	if fan := tile()["风扇"]; fan.Control != nil || len(fan.Actions) == 0 {
+		t.Errorf("a remote with one power button: %+v", fan)
+	}
+
+	press := func(entity, value string) *wire.ActionResult {
+		t.Helper()
+		res, _ := actV(t, a, 6, pageState{}, "ctl:ir", map[string]string{"entity": entity, "ir:" + entity: value})
+		return res
+	}
+	if res := press(tvOn, "true"); r.lastCall() != "button.press ["+tvOn+"] {}" || res.Toast != "已发送「开机」" {
+		t.Errorf("on: %q %q", r.lastCall(), res.Toast)
+	}
+	if res := press(tvOn, "false"); r.lastCall() != "button.press ["+tvOff+"] {}" || res.Toast != "已发送「关机」" {
+		t.Errorf("off: %q %q", r.lastCall(), res.Toast)
+	}
+	for _, c := range []struct{ entity, value, toast string }{
+		{tvUp, "true", errNoEntity.Error()},  // not a remote's 开机
+		{tvOff, "true", errNoEntity.Error()}, // nor its 关机
+		{fanOn, "true", errNoEntity.Error()}, // a remote without a switch
+		{tvOn, "on", errUnknownOp.Error()},
+	} {
+		if res := press(c.entity, c.value); r.lastCall() != "button.press ["+tvOff+"] {}" || res.Toast != c.toast {
+			t.Errorf("%s=%s went through: %q %q", c.entity, c.value, r.lastCall(), res.Toast)
+		}
+	}
+
+	// 标记为已关 (irmarks.go): offered only while the switch is on, it sends nothing and keeps the switch off until 开机
+	// is pressed again, across a restart (the data directory). The menu stays within four entries.
+	titles := func(x wire.Tile) (out []string) {
+		for _, m := range x.Actions {
+			out = append(out, m.Title)
+		}
+		return out
+	}
+	put(at(time.Hour), at(2*time.Hour))
+	sw(on)
+	tv := tile()["电视"]
+	if got := titles(tv); !slices.Equal(got, []string{"开机", "关机", "标记为已关", "音量+"}) {
+		t.Errorf("the menu while on: %q", got)
+	}
+	calls := r.lastCall()
+	res, _ := actV(t, a, 6, pageState{}, tv.Actions[2].Action.ID, tv.Actions[2].Action.Values)
+	if res.Toast != "已标记为关，没有发送信号" || r.lastCall() != calls {
+		t.Errorf("marking off: %q, sent %q", res.Toast, r.lastCall())
+	}
+	sw(off)
+	if got := titles(tile()["电视"]); slices.Contains(got, "标记为已关") {
+		t.Errorf("offered while off: %q", got)
+	}
+	b := newApp(t.Logf)
+	b.marks.load(a.dataDir, t.Logf)
+	if b.marks.get(tvOn).IsZero() {
+		t.Errorf("the mark was not kept in %s", a.dataDir)
+	}
+	put(at(0), at(2*time.Hour))
+	sw(on) // 开机 pressed after the mark
+	for _, eid := range []string{tvUp, tvOff, fanOn, "bad id"} {
+		if res, _ := actV(t, a, 6, pageState{}, "irmark", map[string]string{"entity": eid}); res.Toast == "已标记为关，没有发送信号" {
+			t.Errorf("marked %q", eid)
+		}
+	}
+	if act := irMarkAction("button." + strings.Repeat("x", idMost)); act.ID != "irmark" || act.Values["entity"] == "" {
+		t.Errorf("a long id: %+v", act)
+	}
+}
+
+// Opening an entity pushes its page (#774), so the app's back returns to the page below; an older app calls
+// open:<entity> and gets the page in place (TestPage opens it so).
+func TestOpenPushesTheEntityPage(t *testing.T) {
+	for _, eid := range []string{"light.living", "sensor." + strings.Repeat("x", idMost)} {
+		act := openAction(eid)
+		var st pageState
+		if act.Push == nil || json.Unmarshal([]byte(act.Push.State), &st) != nil || st != (pageState{Entity: eid}) {
+			t.Errorf("%s: push %+v", eid, act.Push)
+		}
+		if act.ID != "open:"+eid && (act.ID != "open" || act.Values["entity"] != eid) {
+			t.Errorf("%s: an older app's action %+v", eid, act)
+		}
+	}
 }
 
 func TestEntityNameKeepsWhatTheUserWrote(t *testing.T) {
