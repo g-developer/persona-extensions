@@ -4,9 +4,9 @@
 
 - **The overview card counts entries.** The home card counted the old items (facts, practices and knowledge with
   status active or established), which the current curation no longer fills, so "做事方式" and "知识" read 0. It now
-  shows, beside 待确认 and the last daily pass, the entries per facet that may go out to the assistant (live, stable,
-  not sensitive: the exits' own gate) for the six facets of the plugin page, under the page's names (① 和 AI 的交互 …
-  ⑥ 关于你). People cards are not counted (they have their own tab).
+  shows the entries per facet that may go out to the assistant (live, stable, not sensitive: the exits' own gate) for
+  the six facets of the plugin page, under the page's names (① 和 AI 的交互 … ⑥ 关于你), then 待确认 and the last
+  daily pass in a second row (a stat grid holds six at most). People cards are not counted (they have their own tab).
 - **The tools answer while a pass runs.** A daily pass holds the state's lock for its whole run, tens of minutes with
   a real model, and `enkeep_rerun_status`, `enkeep_recall` and `enkeep_mark_wrong` waited for it until the hub gave
   up. The status and `enkeep_recall` now read the pages' snapshot (the status says the snapshot's time and the pass in

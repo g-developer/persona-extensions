@@ -488,10 +488,10 @@ func (a *app) homeAction(ctx context.Context, r *ext.UIRequest) (*wire.ActionRes
 	return &wire.ActionResult{View: v, Toast: toast}, nil
 }
 
-// today is the overview card (0.2.0-beta.38): the pending proposals, then per facet the entries that may go out to
-// the assistant (stable, live, not sensitive: the exits' own gate), named as the plugin page names the facets, and
-// the last daily pass. It used to count the old items (facts, practices, knowledge with status active or
-// established), which the current curation no longer fills: "ways of working" and "knowledge" read 0.
+// today is the overview card (0.2.0-beta.38): per facet the entries that may go out to the assistant (stable, live,
+// not sensitive: the exits' own gate), named as the plugin page names the facets; then the pending proposals and the
+// last daily pass (a stat grid holds six at most). It used to count the old items (facts, practices, knowledge with
+// status active or established), which the current curation no longer fills: "ways of working" and "knowledge" read 0.
 func (a *app) today(ctx context.Context, r *ext.UIRequest) (*wire.View, error) {
 	if a.c == nil {
 		return &wire.View{Sections: []wire.Section{{Items: []wire.Component{secondary("还没准备好")}}}}, nil
@@ -499,9 +499,9 @@ func (a *app) today(ctx context.Context, r *ext.UIRequest) (*wire.View, error) {
 	t := a.lang(r)
 	st, done := a.read()
 	defer done()
-	stats := []wire.Stat{{Label: t.s("待确认", "To confirm"), Value: fmt.Sprint(pendingProposals(st))}}
+	var facets []wire.Stat // a stat grid holds at most six: the facets in one, the rest in a second
 	for f, n := range exportableCounts(st) {
-		stats = append(stats, wire.Stat{Label: t.facetLabel(facetsShown[f]), Value: fmt.Sprint(n)})
+		facets = append(facets, wire.Stat{Label: t.facetLabel(facetsShown[f]), Value: fmt.Sprint(n)})
 	}
 	last := t.s("还没运行过", "not run yet")
 	for i := len(st.Runs) - 1; i >= 0; i-- {
@@ -510,8 +510,12 @@ func (a *app) today(ctx context.Context, r *ext.UIRequest) (*wire.View, error) {
 			break
 		}
 	}
-	stats = append(stats, wire.Stat{Label: t.s("最近一次日级", "Last daily pass"), Value: last})
-	return &wire.View{Sections: []wire.Section{{Items: []wire.Component{{Type: wire.ComponentStatGrid, Stats: stats}}}}}, nil
+	more := []wire.Stat{{Label: t.s("待确认", "To confirm"), Value: fmt.Sprint(pendingProposals(st))},
+		{Label: t.s("最近一次日级", "Last daily pass"), Value: last}}
+	return &wire.View{Sections: []wire.Section{{Items: []wire.Component{
+		{Type: wire.ComponentStatGrid, Stats: facets},
+		{Type: wire.ComponentStatGrid, Stats: more},
+	}}}}, nil
 }
 
 // exportableCounts are the entries per facet (in facetsShown's order) that may go out to the assistant.

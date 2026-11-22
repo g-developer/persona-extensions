@@ -181,9 +181,11 @@ func TestOverviewCardCountsEntries(t *testing.T) {
 	}
 	got := map[string]string{}
 	var labels []string
-	for _, s := range v.Sections[0].Items[0].Stats {
-		got[s.Label] = s.Value
-		labels = append(labels, s.Label)
+	for _, c := range v.Sections[0].Items {
+		for _, s := range c.Stats {
+			got[s.Label] = s.Value
+			labels = append(labels, s.Label)
+		}
 	}
 	want := map[string]string{"待确认": "1", "① 和 AI 的交互": "1", "② AI 和工具": "0", "③ 默认判断": "0", "④ 处理方式": "2", "最近一次日级": "还没运行过"}
 	for k, w := range want {
@@ -191,7 +193,7 @@ func TestOverviewCardCountsEntries(t *testing.T) {
 			t.Errorf("%s = %q, want %q (card %v)", k, got[k], w, got)
 		}
 	}
-	if len(labels) != 8 || labels[0] != "待确认" || labels[7] != "最近一次日级" {
+	if len(labels) != 8 || labels[0] != "① 和 AI 的交互" || labels[5] != "⑥ 关于你" || labels[6] != "待确认" {
 		t.Errorf("labels %v", labels)
 	}
 	for _, old := range []string{"事实", "做事方式", "知识"} {
