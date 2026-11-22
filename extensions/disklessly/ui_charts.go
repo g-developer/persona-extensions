@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -494,6 +495,141 @@ func cleanImpactChart(ms MachineStatus, scan *Scan) (wire.Component, bool) {
 		Series:  series,
 		Detail: fmt.Sprintf("预计水位 %.1f%% (%s) → %.1f%% (%s)，可用空间 +%s",
 			ms.UsedPercent, beforeNote, afterPct, afterNote, FormatBytes(scan.SafeBytes)),
+	}, true
+}
+
+// CategoryTileColors maps each Disklessly category to a wire Color matching the dashboard treemap palette.
+var CategoryTileColors = map[string]string{
+	CatGoCache:          wire.ColorTeal,
+	CatNodePythonCache:  wire.ColorBlue,
+	CatDockerUnused:     wire.ColorIndigo,
+	CatRustXcodeBuild:   wire.ColorPurple,
+	CatTmpLogs:          wire.ColorAmber,
+	CatColdAgentSession: wire.ColorOrange,
+}
+
+// CategoryTileIcons maps each Disklessly category to a valid wire NavIcon.
+var CategoryTileIcons = map[string]string{
+	CatGoCache:          "folder",
+	CatNodePythonCache:  "code",
+	CatDockerUnused:     "plugin",
+	CatRustXcodeBuild:   "settings",
+	CatTmpLogs:          "doc",
+	CatColdAgentSession: "cloud",
+}
+
+// reclaimTreemapGrid builds a colored block-map grid (largest-first) mirroring Disklessly's treemap,
+// with click-to-drill-down and native right-click/long-press RowActions on every tile.
+func reclaimTreemapGrid(m *Machine, ms MachineStatus, bd categoryBreakdown, keyPrefix string) (wire.Component, bool) {
+	type catEntry struct {
+		id    string
+		bytes uint64
+	}
+	var cats []catEntry
+	for _, cid := range CategoryIDs {
+		if tot := bd.catTotal(cid); tot > 0 {
+			cats = append(cats, catEntry{id: cid, bytes: tot})
+		}
+	}
+	if len(cats) == 0 {
+		return wire.Component{}, false
+	}
+	sort.Slice(cats, func(i, j int) bool {
+		if cats[i].bytes != cats[j].bytes {
+			return cats[i].bytes > cats[j].bytes
+		}
+		return cats[i].id < cats[j].id
+	})
+
+	tiles := make([]wire.Tile, 0, len(cats)+1)
+	for _, c := range cats {
+		cid := c.id
+		tot := c.bytes
+		share := 0.0
+		if bd.totalShown > 0 {
+			share = float64(tot) * 100.0 / float64(bd.totalShown)
+		}
+		cnt := bd.counts[cid]
+		var badge *wire.Badge
+		var acts []wire.RowAction
+		targetTab := tabItems
+		var act *wire.Action
+
+		if cid == CatColdAgentSession {
+			badge = &wire.Badge{Text: "上云", Color: wire.ColorOrange}
+			targetTab = tabSessions
+			act = &wire.Action{ID: "select-machine", Values: map[string]string{"m": m.ID, "t": targetTab}}
+			acts = []wire.RowAction{
+				{Title: "查看冷会话", Icon: "chat", Swipe: true, Action: wire.Action{ID: "select-machine", Values: map[string]string{"m": m.ID, "t": tabSessions}}},
+				{Title: "筛选明细", Icon: "search", Action: wire.Action{ID: "select-machine", Values: map[string]string{"m": m.ID, "t": tabItems, "q": CategoryLabels[cid]}}},
+			}
+		} else {
+			if bd.review[cid] > 0 && bd.safe[cid] == 0 {
+				badge = &wire.Badge{Text: "确认", Tone: wire.ToneCaution}
+			} else if bd.review[cid] > 0 {
+				badge = &wire.Badge{Text: "混合", Tone: wire.ToneCaution}
+			} else {
+				badge = &wire.Badge{Text: "安全", Tone: wire.TonePositive}
+			}
+			act = &wire.Action{ID: "select-machine", Values: map[string]string{"m": m.ID, "t": tabItems, "q": CategoryLabels[cid]}}
+			acts = []wire.RowAction{
+				{
+					Title: "清理此分类",
+					Icon:  "trash",
+					Role:  wire.ButtonRoleDestructive,
+					Swipe: true,
+					Action: wire.Action{
+						ID:      "clean-category",
+						Values:  map[string]string{"m": m.ID, "cat": cid},
+						Confirm: categoryConfirm(m, cid, cnt, tot),
+					},
+				},
+				{Title: "筛选明细", Icon: "search", Action: wire.Action{ID: "select-machine", Values: map[string]string{"m": m.ID, "t": tabItems, "q": CategoryLabels[cid]}}},
+				{Title: "清理计划", Icon: "list", Action: wire.Action{ID: "open-plan", Values: map[string]string{"m": m.ID}}},
+			}
+		}
+
+		sub := fmt.Sprintf("%.1f%% · %d 项", share, cnt)
+		if cnt == 0 {
+			sub = fmt.Sprintf("%.1f%%", share)
+		}
+		tiles = append(tiles, wire.Tile{
+			Key:      keyPrefix + "-tile-" + m.ID + "-" + cid,
+			Title:    CategoryCompactLabels[cid],
+			Value:    FormatBytes(tot),
+			Subtitle: sub,
+			Icon:     CategoryTileIcons[cid],
+			Color:    CategoryTileColors[cid],
+			Active:   true,
+			Badge:    badge,
+			Action:   act,
+			Actions:  acts,
+		})
+	}
+
+	if ms.TotalBytes > 0 {
+		freePct := max(0.0, 100.0-ms.UsedPercent)
+		tiles = append(tiles, wire.Tile{
+			Key:      keyPrefix + "-tile-" + m.ID + "-free",
+			Title:    "可用空间",
+			Value:    FormatBytes(ms.AvailableBytes),
+			Subtitle: fmt.Sprintf("%.1f%% 剩余 · 共 %s", freePct, FormatBytes(ms.TotalBytes)),
+			Icon:     "check",
+			Color:    wire.ColorGreen,
+			Active:   false,
+			Action:   &wire.Action{ID: "scan", Values: map[string]string{"m": m.ID}},
+			Actions: []wire.RowAction{
+				{Title: "重新扫描", Icon: "refresh", Swipe: true, Action: wire.Action{ID: "scan", Values: map[string]string{"m": m.ID}}},
+				{Title: "清理计划", Icon: "list", Action: wire.Action{ID: "open-plan", Values: map[string]string{"m": m.ID}}},
+			},
+		})
+	}
+
+	return wire.Component{
+		Type:       wire.ComponentGrid,
+		Key:        keyPrefix + "-grid-" + m.ID,
+		MaxColumns: 3,
+		Tiles:      tiles,
 	}, true
 }
 

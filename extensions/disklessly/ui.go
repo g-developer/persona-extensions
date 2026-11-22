@@ -80,6 +80,16 @@ func (d draw) fitVersion(v *wire.View) *wire.View {
 		if !d.v7() {
 			s.Key = ""
 		}
+		if !d.v6() {
+			filtered := make([]wire.Component, 0, len(s.Items))
+			for _, it := range s.Items {
+				if it.Type == wire.ComponentGrid {
+					continue
+				}
+				filtered = append(filtered, it)
+			}
+			s.Items = filtered
+		}
 		for ii := range s.Items {
 			it := &s.Items[ii]
 			if !d.v6() {
@@ -383,6 +393,32 @@ func (d draw) fleetTab(_ page, statuses []MachineStatus, selected *Machine) []wi
 			subParts = append(subParts, "尚未扫描")
 		}
 
+		var rowActions []wire.RowAction
+		if d.v6() && idx < 40 {
+			rowActions = []wire.RowAction{
+				{Title: "扫描", Icon: "refresh", Swipe: true, Action: wire.Action{ID: "scan", Values: map[string]string{"m": m.ID}}},
+				{Title: "清理计划", Icon: "list", Action: wire.Action{ID: "open-plan", Values: map[string]string{"m": m.ID}}},
+			}
+			if ms.SafeBytes > 0 {
+				rowActions = append(rowActions, wire.RowAction{
+					Title: "一键安全清理",
+					Icon:  "trash",
+					Role:  wire.ButtonRoleDestructive,
+					Swipe: true,
+					Action: wire.Action{
+						ID:      "clean-safe",
+						Values:  map[string]string{"m": m.ID},
+						Confirm: fmt.Sprintf("对「%s」执行全部 safe 等级可重建缓存清理（预计释放 %s）？运行中容器、活跃仓库与 Agent 会话绝不触碰；冷会话上云需在「会话与台账」单独执行。", m.Name, FormatBytes(ms.SafeBytes)),
+					},
+				})
+			}
+			rowActions = append(rowActions, wire.RowAction{
+				Title:  "编辑机器",
+				Icon:   "edit",
+				Action: wire.Action{ID: "edit-machine", Values: map[string]string{"m": m.ID}},
+			})
+		}
+
 		sec := wire.Section{
 			Title: machineLabel(m),
 			Items: []wire.Component{
@@ -394,6 +430,7 @@ func (d draw) fleetTab(_ page, statuses []MachineStatus, selected *Machine) []wi
 					Subtitle: strings.Join(subParts, " · "),
 					Badge:    badge,
 					Action:   &wire.Action{ID: "select-machine", Values: map[string]string{"m": m.ID, "t": tabItems}},
+					Actions:  rowActions,
 				},
 			},
 		}
@@ -453,6 +490,11 @@ func (d draw) fleetTab(_ page, statuses []MachineStatus, selected *Machine) []wi
 					{Label: "冷会话 (>7d)", Value: fmt.Sprintf("%d 个", ms.Sessions.ColdCount), Detail: FormatBytes(ms.Sessions.ColdBytes) + " · 热 " + strconv.Itoa(ms.Sessions.HotCount) + " 个", Tone: toneIf(ms.Sessions.ColdBytes > 0, wire.ToneCaution)},
 				})...)
 
+				if d.v6() && idx < 6 {
+					if grid, ok := reclaimTreemapGrid(m, ms, bd, "fleet"); ok {
+						sec.Items = append(sec.Items, grid)
+					}
+				}
 				sec.Items = append(sec.Items, rootUsageChart(ms, mountPoint, "fleet"))
 				if catChart, ok := reclaimCategoryChart(m, bd, "fleet"); ok {
 					sec.Items = append(sec.Items, catChart)
@@ -602,9 +644,19 @@ func (d draw) itemsTab(p page, m *Machine, scan *Scan) []wire.Section {
 	bd := summarizeCategories(filtered, sessForChart)
 
 	if d.v2() && scan.Mount.TotalBytes > 0 {
+		chartItems := make([]wire.Component, 0, 3)
+		chartFooter := ""
+		if d.v6() {
+			if grid, ok := reclaimTreemapGrid(m, ms, bd, "items"); ok {
+				chartItems = append(chartItems, grid)
+				chartFooter = "点击方块下钻筛选对应分类；右键（或长按 / 点「…」）可直接清理分类或打开清理计划。"
+			}
+		}
+		chartItems = append(chartItems, rootUsageChart(ms, scan.Mount.MountPoint, "items"))
 		chartSec := wire.Section{
-			Title: "磁盘水位与分类占用图",
-			Items: []wire.Component{rootUsageChart(ms, scan.Mount.MountPoint, "items")},
+			Title:  "磁盘水位与分类占用图",
+			Items:  chartItems,
+			Footer: chartFooter,
 		}
 		if catChart, ok := reclaimCategoryChart(m, bd, "items"); ok {
 			chartSec.Items = append(chartSec.Items, catChart)
@@ -670,10 +722,38 @@ func (d draw) itemsBreakdownSections(m *Machine, ms MachineStatus, scan *Scan, f
 		})
 	}
 
+	actionsUsed := 0
+	if d.v6() {
+		// Reserve headroom for up to 7 tiles in the items treemap grid so total rows/tiles with Actions stays < RowsWithActionsMost (100).
+		actionsUsed = len(CategoryIDs) + 1
+	}
+
 	// Per-category quick clean rows
 	for _, cid := range CategoryIDs {
 		if catBytes[cid] == 0 {
 			continue
+		}
+		var catActions []wire.RowAction
+		if d.v6() && actionsUsed < 90 {
+			actionsUsed++
+			catActions = []wire.RowAction{
+				{
+					Title: "立即清理",
+					Icon:  "trash",
+					Role:  wire.ButtonRoleDestructive,
+					Swipe: true,
+					Action: wire.Action{
+						ID:      "clean-category",
+						Values:  map[string]string{"m": m.ID, "cat": cid},
+						Confirm: categoryConfirm(m, cid, catCounts[cid], catBytes[cid]),
+					},
+				},
+				{
+					Title:  "筛选此分类",
+					Icon:   "search",
+					Action: wire.Action{ID: "select-machine", Values: map[string]string{"m": m.ID, "t": tabItems, "q": CategoryLabels[cid]}},
+				},
+			}
 		}
 		catSec.Items = append(catSec.Items, wire.Component{
 			Type:     wire.ComponentRow,
@@ -687,6 +767,7 @@ func (d draw) itemsBreakdownSections(m *Machine, ms MachineStatus, scan *Scan, f
 				Values:  map[string]string{"m": m.ID, "cat": cid},
 				Confirm: categoryConfirm(m, cid, catCounts[cid], catBytes[cid]),
 			},
+			Actions: catActions,
 		})
 	}
 
@@ -735,8 +816,39 @@ func (d draw) itemsBreakdownSections(m *Machine, ms MachineStatus, scan *Scan, f
 			bText = "上云 · " + FormatBytes(it.Bytes)
 		}
 		actVerb := "清理"
+		actIcon := "trash"
 		if it.Action == "archive" {
 			actVerb = "归档"
+			actIcon = "cloud"
+		}
+		var itemActions []wire.RowAction
+		if d.v6() && actionsUsed < 90 {
+			actionsUsed++
+			itemActions = []wire.RowAction{
+				{
+					Title: "立即" + actVerb,
+					Icon:  actIcon,
+					Role:  wire.ButtonRoleDestructive,
+					Swipe: true,
+					Action: wire.Action{
+						ID:      "clean-item",
+						Values:  map[string]string{"m": m.ID, "item": it.ID},
+						Confirm: itemConfirm(m, it, actVerb),
+					},
+				},
+			}
+			if it.Category != CatColdAgentSession {
+				itemActions = append(itemActions, wire.RowAction{
+					Title: "清理同分类",
+					Icon:  "folder",
+					Role:  wire.ButtonRoleDestructive,
+					Action: wire.Action{
+						ID:      "clean-category",
+						Values:  map[string]string{"m": m.ID, "cat": it.Category},
+						Confirm: categoryConfirm(m, it.Category, catCounts[it.Category], catBytes[it.Category]),
+					},
+				})
+			}
 		}
 		detailSec.Items = append(detailSec.Items, wire.Component{
 			Type:     wire.ComponentRow,
@@ -749,6 +861,7 @@ func (d draw) itemsBreakdownSections(m *Machine, ms MachineStatus, scan *Scan, f
 				Values:  map[string]string{"m": m.ID, "item": it.ID},
 				Confirm: itemConfirm(m, it, actVerb),
 			},
+			Actions: itemActions,
 		})
 	}
 
@@ -1302,6 +1415,7 @@ func (a *app) action(ctx context.Context, r *ext.UIRequest) (*wire.ActionResult,
 	case "select-machine":
 		p.Machine = cmp.Or(r.Values["m"], p.Machine)
 		p.Tab = cmp.Or(r.Values["t"], tabItems)
+		p.Query = strings.TrimSpace(r.Values["q"])
 		p.Mode = modeHome
 	case "open-plan":
 		p.Machine = cmp.Or(r.Values["m"], p.Machine)

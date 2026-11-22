@@ -885,3 +885,103 @@ func TestLargeFleetStaysWithinViewItemBudget(t *testing.T) {
 		assertNoPrivateDataInViewJSON(t, fmt.Sprintf("large-fleet-v%d", uiVer), v)
 	}
 }
+
+func TestTreemapGridAndRightClickActions(t *testing.T) {
+	a := seedScannedThreeMachineFleet(t)
+	ctx := context.Background()
+
+	// 1. UIVersion >= 6 renders ComponentGrid treemap blocks (ordered largest-first + free space tile)
+	// and right-click RowActions on machine rows, category tiles, category rows, and item rows.
+	for _, uiVer := range []int{6, 9, 11} {
+		fleetView, err := a.render(ctx, &ext.UIRequest{UIParams: wire.UIParams{UIVersion: uiVer, TZ: "Asia/Shanghai"}})
+		if err != nil {
+			t.Fatalf("fleet uiVer %d: %v", uiVer, err)
+		}
+		checkStrictView(t, fleetView, false)
+
+		grid := findComponentByKey(fleetView, "fleet-grid-mac-mini")
+		if grid == nil || grid.Type != wire.ComponentGrid {
+			t.Fatalf("uiVer %d: expected fleet-grid-mac-mini ComponentGrid, got %+v", uiVer, grid)
+		}
+		if len(grid.Tiles) < 3 {
+			t.Fatalf("uiVer %d: expected >= 3 treemap tiles (categories + free), got %d", uiVer, len(grid.Tiles))
+		}
+		// Largest category (rust-xcode-build: 7.5 GiB) must come before go-cache (1 GiB).
+		if grid.Tiles[0].Key != "fleet-tile-mac-mini-rust-xcode-build" || grid.Tiles[0].Color != wire.ColorPurple {
+			t.Fatalf("uiVer %d: first tile = %+v, want rust-xcode-build purple tile", uiVer, grid.Tiles[0])
+		}
+		if len(grid.Tiles[0].Actions) < 2 {
+			t.Fatalf("uiVer %d: category tile missing right-click RowActions: %+v", uiVer, grid.Tiles[0].Actions)
+		}
+		last := grid.Tiles[len(grid.Tiles)-1]
+		if last.Key != "fleet-tile-mac-mini-free" || last.Color != wire.ColorGreen || len(last.Actions) == 0 {
+			t.Fatalf("uiVer %d: last tile should be green free-space tile with actions, got %+v", uiVer, last)
+		}
+
+		machRow := findComponentByKey(fleetView, "mach-mac-mini")
+		if machRow == nil || len(machRow.Actions) < 3 {
+			t.Fatalf("uiVer %d: machine row missing right-click actions: %+v", uiVer, machRow)
+		}
+
+		itemsView, err := a.render(ctx, &ext.UIRequest{UIParams: wire.UIParams{
+			UIVersion: uiVer,
+			State:     ext.EncodeState(page{Machine: "mac-mini", Tab: tabItems}),
+		}})
+		if err != nil {
+			t.Fatalf("items uiVer %d: %v", uiVer, err)
+		}
+		checkStrictView(t, itemsView, false)
+
+		itemsGrid := findComponentByKey(itemsView, "items-grid-mac-mini")
+		if itemsGrid == nil || itemsGrid.Type != wire.ComponentGrid {
+			t.Fatalf("uiVer %d: expected items-grid-mac-mini ComponentGrid, got %+v", uiVer, itemsGrid)
+		}
+		catRow := findComponentByKey(itemsView, "cat-clean-rust-xcode-build")
+		if catRow == nil || len(catRow.Actions) < 2 {
+			t.Fatalf("uiVer %d: category row missing right-click actions: %+v", uiVer, catRow)
+		}
+		itemRow := findComponentByKey(itemsView, "item-cache-xcode-derived")
+		if itemRow == nil || len(itemRow.Actions) < 2 {
+			t.Fatalf("uiVer %d: item row missing right-click actions: %+v", uiVer, itemRow)
+		}
+	}
+
+	// 2. Clicking a category tile triggers select-machine with q, filtering itemsTab to that category.
+	baseView, err := a.render(ctx, &ext.UIRequest{UIParams: wire.UIParams{UIVersion: 8}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.action(ctx, &ext.UIRequest{UIParams: wire.UIParams{
+		UIVersion: 8,
+		State:     baseView.State,
+		Action:    "select-machine",
+		Values:    map[string]string{"m": "mac-mini", "t": tabItems, "q": CategoryLabels[CatGoCache]},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkStrictView(t, res.View, false)
+	if findComponentByKey(res.View, "item-cache-gobuild") == nil {
+		t.Fatal("filtered itemsTab should include item-cache-gobuild")
+	}
+	if findComponentByKey(res.View, "item-cache-xcode-derived") != nil {
+		t.Fatal("filtered itemsTab should exclude item-cache-xcode-derived when filtered to Go cache")
+	}
+
+	// 3. UIVersion < 6 strips ComponentGrid and RowActions cleanly.
+	v4View, err := a.render(ctx, &ext.UIRequest{UIParams: wire.UIParams{UIVersion: 4}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkStrictView(t, v4View, false)
+	for _, s := range v4View.Sections {
+		for _, it := range s.Items {
+			if it.Type == wire.ComponentGrid {
+				t.Fatalf("UIVersion 4 should strip ComponentGrid: %+v", it)
+			}
+			if len(it.Actions) > 0 {
+				t.Fatalf("UIVersion 4 should strip RowActions: %+v", it)
+			}
+		}
+	}
+}
