@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -29,6 +30,54 @@ func waitResult(t *testing.T, done chan acceptResult) acceptResult {
 	case <-time.After(20 * time.Second):
 		t.Fatal("the acceptance command did not report")
 		return acceptResult{}
+	}
+}
+
+func TestToolPathPreservesExistingEntriesAndFindsGitAndAcceptanceTools(t *testing.T) {
+	_, repo := newTestRepo(t)
+	head := runGit(t, repo, "rev-parse", "HEAD")
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	localBin := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(localBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(gitPath, filepath.Join(localBin, "git")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localBin, "ats-test-tool"), []byte("#!/bin/sh\necho found-tool\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := t.TempDir()
+	t.Setenv("PATH", oldPath)
+	t.Setenv("HOME", home)
+	t.Setenv("PERSONA_TEST_TOKEN", "hidden")
+	var path string
+	for _, kv := range cleanEnv() {
+		if strings.HasPrefix(kv, "PERSONA_") {
+			t.Fatalf("Persona-injected variable was forwarded: %q", kv)
+		}
+		if value, ok := strings.CutPrefix(kv, "PATH="); ok {
+			path = value
+		}
+	}
+	if dirs := filepath.SplitList(path); len(dirs) < 2 || dirs[0] != oldPath || dirs[len(dirs)-1] != localBin {
+		t.Fatalf("PATH did not preserve precedence and include the user's bin: %q", path)
+	}
+	if got, err := git(t.Context(), repo, "rev-parse", "HEAD"); err != nil || got != head {
+		t.Fatalf("git with augmented PATH: %q (%v)", got, err)
+	}
+	if got := runAcceptance(t.Context(), repo, "ats-test-tool"); got.ExitCode != 0 || strings.TrimSpace(got.OutputTail) != "found-tool" {
+		t.Fatalf("acceptance with augmented PATH: %+v", got)
+	}
+	t.Setenv("PATH", strings.Join([]string{oldPath, localBin}, string(os.PathListSeparator)))
+	for _, kv := range cleanEnv() {
+		if value, ok := strings.CutPrefix(kv, "PATH="); ok && strings.Count(value, localBin) != 1 {
+			t.Fatalf("PATH contains more than one user bin: %q", value)
+		}
 	}
 }
 

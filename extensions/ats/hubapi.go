@@ -162,7 +162,7 @@ func (c *hubClient) doWithClient(ctx context.Context, client *http.Client, metho
 		if e.Code == "" {
 			e.Code = fmt.Sprintf("http_%d", resp.StatusCode)
 		}
-		return fmt.Errorf("%s %s: %s %s", method, strings.SplitN(path, "?", 2)[0], e.Code, firstLinePreview(e.Error, 200))
+		return fmt.Errorf("%s %s: HTTP %d (%s) %s", method, strings.SplitN(path, "?", 2)[0], resp.StatusCode, e.Code, firstLinePreview(e.Error, 200))
 	}
 	if out == nil || len(raw) == 0 {
 		return nil

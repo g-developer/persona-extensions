@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -20,6 +23,127 @@ func artifactKinds(t *Task) []string {
 		kinds = append(kinds, a.Kind)
 	}
 	return kinds
+}
+
+type todoAttachTestHub struct {
+	*fakeHub
+	client *hubClient
+}
+
+func (h todoAttachTestHub) AttachTodo(ctx context.Context, todo, machine, session string) error {
+	return h.client.AttachTodo(ctx, todo, machine, session)
+}
+
+func TestTodoAttachOutcomeIsVisibleAfterQueueReload(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		warn   bool
+	}{
+		{"conflict", http.StatusConflict, true},
+		{"attached", http.StatusNoContent, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.Method != http.MethodPut || req.URL.Path != "/api/v1/todos/todo_1/agents/"+testMachine+"/session-1" {
+					t.Errorf("attach request: %s %s", req.Method, req.URL.Path)
+				}
+				w.WriteHeader(tc.status)
+				if tc.warn {
+					_, _ = w.Write([]byte(`{"code":"todo_closed","error":"the to-do is already complete"}`))
+				}
+			}))
+			defer srv.Close()
+			r.d.api = todoAttachTestHub{fakeHub: r.hub, client: newHubClient(srv.URL, "test-token")}
+			task := r.enqueue(EnqueueInput{Title: "Record the attachment result"})
+			check := func(terminal bool) {
+				t.Helper()
+				q, err := NewQueue(filepath.Dir(r.q.dataFile), r.cfg.queueConfig())
+				if err != nil {
+					t.Fatal(err)
+				}
+				h := (&atsApp{queue: q}).handler()
+				get := func(path string) map[string]json.RawMessage {
+					t.Helper()
+					rec := httptest.NewRecorder()
+					h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+					body := map[string]json.RawMessage{}
+					if err := json.Unmarshal(rec.Body.Bytes(), &body); rec.Code != http.StatusOK || err != nil {
+						t.Fatalf("GET %s: %d %s (%v)", path, rec.Code, rec.Body, err)
+					}
+					return body
+				}
+				path := "/tasks/" + task.ID
+				view, evidence := get(path), get(path+"/evidence")
+				var attempts []map[string]json.RawMessage
+				if err := json.Unmarshal(view["attempts"], &attempts); err != nil || len(attempts) != 1 {
+					t.Fatalf("attempts: %s (%v)", view["attempts"], err)
+				}
+				warnings := []json.RawMessage{attempts[0]["todo_attach_error"], evidence["todo_attach_error"]}
+				if terminal {
+					var report map[string]json.RawMessage
+					if err := json.Unmarshal(evidence["last_report"], &report); err != nil {
+						t.Fatal(err)
+					}
+					warnings = append(warnings, report["todo_attach_error"])
+				}
+				for _, warning := range warnings {
+					if tc.warn && !strings.Contains(string(warning), "409") || !tc.warn && warning != nil {
+						t.Fatalf("todo_attach_error = %s (want warning = %v)", warning, tc.warn)
+					}
+				}
+			}
+			r.tick()
+			check(false)
+			r.hub.turnEnds("session-1", "u1", "Finished the review.")
+			r.tick()
+			r.tick()
+			if got := r.task(task.ID); got.State != StateSucceeded {
+				t.Fatalf("the review did not finish: %s", got.State)
+			}
+			check(true)
+		})
+	}
+}
+
+func TestReadonlyWithoutAcceptanceStillReportsAndKeepsSourceChanges(t *testing.T) {
+	for _, stage := range []string{"untracked", "modified", "committed", "tool configuration"} {
+		t.Run(stage, func(t *testing.T) {
+			r := newRig(t)
+			task := r.enqueue(EnqueueInput{Title: "Inspect source"})
+			r.tick()
+			wt := r.task(task.ID).Exec.Worktree
+			runGit(t, wt, "config", "status.showUntrackedFiles", "no")
+			name := "README.md"
+			switch stage {
+			case "untracked":
+				name = "new-source.go"
+			case "tool configuration":
+				name = ".serena/project.yml"
+				if err := os.Mkdir(filepath.Join(wt, ".serena"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(wt, name), []byte("changed\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if stage == "committed" {
+				runGit(t, wt, "add", name)
+				runGit(t, wt, "commit", "-qm", "unexpected change")
+			}
+			r.hub.turnEnds("session-1", "u1", "Finished the review.")
+			r.tick()
+			r.tick()
+			got := r.task(task.ID)
+			if len(got.Reports) != 1 || !got.Reports[0].Dirty || !slices.Contains(artifactKinds(got), "worktree") {
+				t.Fatalf("missing dirty worktree evidence: %+v", got.Reports)
+			}
+			if _, err := os.Stat(filepath.Join(wt, name)); err != nil {
+				t.Fatalf("worktree did not retain the work: %v", err)
+			}
+		})
+	}
 }
 
 func TestWritingTaskRunsInItsOwnWorktreeAndPassesAcceptance(t *testing.T) {

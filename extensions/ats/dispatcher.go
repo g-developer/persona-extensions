@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -271,8 +272,18 @@ func (d *dispatcher) prepare(ctx context.Context, t *Task, att Attempt) bool {
 	}
 	if todo := t.TodoID(); todo != "" {
 		actx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		_ = d.api.AttachTodo(actx, todo, e.MachineID, sid) // the to-do may be finished or gone; the task runs anyway
+		err := d.api.AttachTodo(actx, todo, e.MachineID, sid)
 		cancel()
+		if err != nil {
+			warning := firstLinePreview(err.Error(), 500)
+			slog.Warn("ATS could not attach session to to-do", "task_id", t.ID, "attempt", att.AttemptNo,
+				"todo_id", todo, "machine_id", e.MachineID, "session_id", sid, "error", warning)
+			if _, err := d.q.UpdateExec(t.ID, t.FenceToken, d.now(), func(e *Execution) {
+				e.TodoAttachError = warning
+			}); err != nil {
+				slog.Warn("ATS could not save to-do attachment error", "task_id", t.ID, "attempt", att.AttemptNo, "error", err)
+			}
+		}
 	}
 	return true
 }
@@ -790,7 +801,10 @@ func (d *dispatcher) finish(ctx context.Context, t *Task, att Attempt, out outco
 		delete(d.planDeclines, key)
 		d.mu.Unlock()
 	}
-	arts := d.cleanup(ctx, t, att.AttemptNo, false)
+	arts, dirty := d.cleanup(ctx, t, att.AttemptNo, false)
+	if t.PermissionProfile != PermissionDefault {
+		out.dirty = out.dirty || dirty
+	}
 	out.artifacts = mergeCommit(out.artifacts, arts, t.Exec)
 	if t.Exec != nil && t.Exec.SessionID != "" {
 		arts = append(arts, Artifact{Kind: "session", Path: t.Exec.MachineID + "/" + t.Exec.SessionID})
@@ -865,10 +879,10 @@ func releaseCommitMessage(t *Task, attempt int) string {
 // could not be committed) and, when the attempt is being canceled, the agent's turn. An attempt of a writable
 // task that ends by itself has its uncommitted work committed to its branch. It returns what stays behind as
 // evidence.
-func (d *dispatcher) cleanup(ctx context.Context, t *Task, attempt int, interrupt bool) []Artifact {
+func (d *dispatcher) cleanup(ctx context.Context, t *Task, attempt int, interrupt bool) ([]Artifact, bool) {
 	e := t.Exec
 	if e == nil || e.MachineID == "" {
-		return nil
+		return nil, false
 	}
 	if interrupt && e.SessionID != "" {
 		ictx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -876,7 +890,7 @@ func (d *dispatcher) cleanup(ctx context.Context, t *Task, attempt int, interrup
 		cancel()
 	}
 	if e.Worktree == "" {
-		return nil
+		return nil, false
 	}
 	msg := ""
 	if !interrupt && t.PermissionProfile == PermissionDefault {
@@ -885,8 +899,10 @@ func (d *dispatcher) cleanup(ctx context.Context, t *Task, attempt int, interrup
 	var rel releaseResult
 	if err := d.nodeCall(ctx, e.MachineID, "ats.release", releaseParams{
 		TaskID: t.ID, Attempt: attempt, Repo: t.Workspace.Repo, BaseSHA: e.BaseSHA, CommitMessage: msg,
+		Readonly: t.PermissionProfile != PermissionDefault,
 	}, &rel); err != nil {
-		return []Artifact{{Kind: "worktree", Path: e.Worktree}}
+		slog.Warn("ATS could not release worktree", "task_id", t.ID, "attempt", attempt, "error", err)
+		return []Artifact{{Kind: "worktree", Path: e.Worktree}}, false
 	}
 	var arts []Artifact
 	if rel.HeadSHA != "" && rel.HeadSHA != e.BaseSHA {
@@ -898,7 +914,7 @@ func (d *dispatcher) cleanup(ctx context.Context, t *Task, attempt int, interrup
 	if rel.Kept != "" {
 		arts = append(arts, Artifact{Kind: "worktree", Path: rel.Kept})
 	}
-	return arts
+	return arts, rel.Dirty
 }
 
 // cancel cancels a task from the queue page: the queue first, then what its attempt holds.

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -80,10 +81,11 @@ type acceptResult struct {
 }
 
 type releaseParams struct {
-	TaskID  string `json:"task_id"`
-	Attempt int    `json:"attempt"`
-	Repo    string `json:"repo"`
-	BaseSHA string `json:"base_sha"`
+	TaskID   string `json:"task_id"`
+	Attempt  int    `json:"attempt"`
+	Repo     string `json:"repo"`
+	BaseSHA  string `json:"base_sha"`
+	Readonly bool   `json:"readonly,omitempty"`
 	// CommitMessage, when set, has uncommitted work committed to the attempt's branch with this message, so the
 	// work is on the branch and the worktree can go.
 	CommitMessage string `json:"commit_message,omitempty"`
@@ -94,6 +96,7 @@ type releaseResult struct {
 	Kept    string `json:"kept,omitempty"` // the worktree, when it was left because of uncommitted work
 	Branch  string `json:"branch,omitempty"`
 	HeadSHA string `json:"head_sha,omitempty"`
+	Dirty   bool   `json:"dirty,omitempty"`
 }
 
 func newNodeWorker(data string, repos []string, notify func(string, any)) *nodeWorker {
@@ -157,26 +160,73 @@ func (n *nodeWorker) allowedRepo(repo string) (string, error) {
 }
 
 func git(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	bin, err := findGit()
+	if err != nil {
+		return "", fmt.Errorf("find git: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, bin, append([]string{"-C", dir}, args...)...)
 	cmd.Env = append(cleanEnv(), "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.CombinedOutput()
 	s := strings.TrimSpace(string(out))
 	if err != nil {
-		return s, fmt.Errorf("git %s: %s", args[0], firstLinePreview(s, 300))
+		if s == "" {
+			return s, fmt.Errorf("git %s: %w", args[0], err)
+		}
+		return s, fmt.Errorf("git %s: %w: %s", args[0], err, firstLinePreview(s, 300))
 	}
 	return s, nil
 }
 
-// cleanEnv is this program's environment without what the hub put there for it.
+// findGit also checks the appended directories because exec resolves a command before applying Cmd.Env.
+func findGit() (string, error) {
+	bin, err := exec.LookPath("git")
+	if !errors.Is(err, exec.ErrNotFound) {
+		return bin, err
+	}
+	for _, dir := range additionalToolDirs(os.Getenv("PATH")) {
+		if path, err := exec.LookPath(filepath.Join(dir, "git")); err == nil {
+			return path, nil
+		}
+	}
+	return "", err
+}
+
+func additionalToolDirs(path string) []string {
+	dirs := []string{"/usr/local/bin", "/opt/homebrew/bin"}
+	if home, err := os.UserHomeDir(); err == nil && filepath.IsAbs(home) {
+		dirs = append(dirs, filepath.Join(home, ".local", "bin"))
+	}
+	existing := filepath.SplitList(path)
+	var added []string
+	for _, dir := range dirs {
+		if slices.ContainsFunc(existing, func(entry string) bool { return filepath.Clean(entry) == dir }) {
+			continue
+		}
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			added = append(added, dir)
+			existing = append(existing, dir)
+		}
+	}
+	return added
+}
+
+// cleanEnv removes Persona-injected variables and completes the tool search path.
 func cleanEnv() []string {
 	var env []string
 	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "PERSONA_") {
+		if strings.HasPrefix(kv, "PERSONA_") || strings.HasPrefix(kv, "PATH=") {
 			continue
 		}
 		env = append(env, kv)
 	}
-	return env
+	path := os.Getenv("PATH")
+	dirs := append(filepath.SplitList(path), additionalToolDirs(path)...)
+	return append(env, "PATH="+strings.Join(dirs, string(os.PathListSeparator)))
+}
+
+func worktreeDirty(ctx context.Context, dir string) (bool, error) {
+	status, err := git(ctx, dir, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
+	return status != "", err
 }
 
 // resolveCommit finds ref in repo, fetching configured remotes if the commit is missing locally so
@@ -286,8 +336,10 @@ func (n *nodeWorker) accept(p acceptParams) error {
 		if sha, err := git(gctx, dir, "rev-parse", "HEAD"); err == nil {
 			res.HeadSHA = sha
 		}
-		if st, err := git(gctx, dir, "status", "--porcelain"); err == nil {
-			res.Dirty = st != ""
+		if dirty, err := worktreeDirty(gctx, dir); err == nil {
+			res.Dirty = dirty
+		} else {
+			res.Error = cmpOr(res.Error, "check worktree: "+err.Error())
 		}
 		gcancel()
 		if raw, err := json.Marshal(res); err == nil {
@@ -309,7 +361,7 @@ func (n *nodeWorker) accept(p acceptParams) error {
 func runAcceptance(ctx context.Context, dir, command string) acceptResult {
 	start := time.Now()
 	tail := &tailBuffer{max: outputTailBytes}
-	cmd := exec.Command("sh", "-c", command)
+	cmd := exec.Command("/bin/sh", "-c", command)
 	cmd.Dir = dir
 	cmd.Env = cleanEnv()
 	cmd.Stdout, cmd.Stderr = tail, tail
@@ -383,17 +435,29 @@ func (n *nodeWorker) release(ctx context.Context, p releaseParams) (releaseResul
 	n.mu.Unlock()
 	_ = os.Remove(n.resultFile(key))
 	path := n.worktree(key)
-	if _, err := os.Stat(path); err != nil {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		return releaseResult{Removed: true}, nil
+	} else if err != nil {
+		return releaseResult{}, fmt.Errorf("check worktree: %w", err)
 	}
 	res := releaseResult{}
-	if sha, err := git(ctx, path, "rev-parse", "HEAD"); err == nil {
-		res.HeadSHA = sha
+	head, err := git(ctx, path, "rev-parse", "HEAD")
+	if err != nil {
+		return res, err
 	}
+	res.HeadSHA = head
 	if b, err := git(ctx, path, "symbolic-ref", "--quiet", "--short", "HEAD"); err == nil {
 		res.Branch = b
 	}
-	if st, err := git(ctx, path, "status", "--porcelain"); err == nil && st != "" {
+	res.Dirty, err = worktreeDirty(ctx, path)
+	if err != nil {
+		return res, err
+	}
+	if p.Readonly && p.BaseSHA != "" && head != p.BaseSHA {
+		res.Dirty, res.Kept = true, path
+		return res, nil
+	}
+	if res.Dirty {
 		if res.Branch == "" || strings.TrimSpace(p.CommitMessage) == "" || commitAll(ctx, path, p.CommitMessage) != nil {
 			res.Kept = path
 			return res, nil
@@ -401,7 +465,7 @@ func (n *nodeWorker) release(ctx context.Context, p releaseParams) (releaseResul
 		if sha, err := git(ctx, path, "rev-parse", "HEAD"); err == nil {
 			res.HeadSHA = sha
 		}
-		if st, err := git(ctx, path, "status", "--porcelain"); err != nil || st != "" {
+		if dirty, err := worktreeDirty(ctx, path); err != nil || dirty {
 			res.Kept = path // something the commit did not take
 			return res, nil
 		}
@@ -410,7 +474,11 @@ func (n *nodeWorker) release(ctx context.Context, p releaseParams) (releaseResul
 	if err != nil {
 		return res, err
 	}
-	if _, err := git(ctx, repo, "worktree", "remove", "--force", path); err != nil {
+	remove := []string{"worktree", "remove"}
+	if !p.Readonly {
+		remove = append(remove, "--force")
+	}
+	if _, err := git(ctx, repo, append(remove, path)...); err != nil {
 		return res, err
 	}
 	res.Removed = true

@@ -165,6 +165,8 @@ type Attempt struct {
 	ErrorClass     string     `json:"error_class,omitempty"`
 	Verdict        string     `json:"verdict,omitempty"`
 	Summary        string     `json:"summary,omitempty"`
+
+	TodoAttachError string `json:"todo_attach_error,omitempty"`
 }
 
 // EvidenceReport stores a verification report from an attempt.
@@ -191,6 +193,8 @@ type EvidenceReport struct {
 	// Summary is the end of the agent's last reply in this attempt: what it says it did and found.
 	Summary   string     `json:"summary,omitempty"`
 	Artifacts []Artifact `json:"artifacts,omitempty"`
+
+	TodoAttachError string `json:"todo_attach_error,omitempty"`
 }
 
 // Task is a persistent unit of work in the ATS queue.
@@ -266,6 +270,8 @@ type Execution struct {
 	JudgedUpdate string `json:"judged_update,omitempty"`
 	LastReply    string `json:"last_reply,omitempty"`
 	Waiting      string `json:"waiting,omitempty"` // why the task needs the user, when it does
+
+	TodoAttachError string `json:"todo_attach_error,omitempty"`
 }
 
 // isActiveState reports whether a task in this state holds a lease.
@@ -1180,6 +1186,8 @@ func (q *Queue) CompleteAttempt(in CompleteAttemptInput) (*Task, error) {
 		Dirty:      in.Dirty,
 		FullReply:  in.FullReply,
 		Artifacts:  slices.Clone(in.Artifacts),
+
+		TodoAttachError: att.TodoAttachError,
 	}
 	t.Reports = append(t.Reports, rep)
 

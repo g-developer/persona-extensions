@@ -124,6 +124,8 @@ type taskView struct {
 	Prompt        string     `json:"prompt,omitempty"`
 	// PromptBytes is the length of the whole prompt, set when Prompt is only its beginning.
 	PromptBytes int `json:"prompt_bytes,omitempty"`
+
+	TodoAttachError string `json:"todo_attach_error,omitempty"`
 }
 
 // How much of the task an answer carries.
@@ -153,6 +155,9 @@ func viewTask(t *Task, prompt int) taskView {
 	}
 	if t.Acceptance != nil {
 		v.Acceptance = t.Acceptance.Command
+	}
+	if n := len(t.Attempts); n > 0 {
+		v.TodoAttachError = t.Attempts[n-1].TodoAttachError
 	}
 	if e := t.Exec; e != nil {
 		v.Phase, v.RunsOn, v.SessionID, v.Waiting = e.Phase, e.MachineID, e.SessionID, e.Waiting
@@ -356,6 +361,7 @@ type evidenceView struct {
 	Model           string          `json:"model,omitempty"`
 	SessionID       string          `json:"session_id,omitempty"`
 	Worktree        string          `json:"worktree,omitempty"`
+	TodoAttachError string          `json:"todo_attach_error,omitempty"`
 	LastReport      *reportView     `json:"last_report,omitempty"`
 	Report          *EvidenceReport `json:"report,omitempty"` // attempt=N: that attempt's report as stored
 }
@@ -427,6 +433,7 @@ func (a *atsApp) getEvidence(w http.ResponseWriter, r *http.Request) {
 		if len(t.Attempts) > 0 || len(t.Reports) > 0 {
 			v := viewTask(t, promptNone)
 			out.Launcher, out.Model, out.SessionID, out.Worktree = v.Launcher, v.Model, v.SessionID, v.Worktree
+			out.TodoAttachError = v.TodoAttachError
 		}
 		if n := len(t.Reports); n > 0 {
 			out.LastReport = viewReport(t.Reports[n-1])
