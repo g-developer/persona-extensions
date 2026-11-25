@@ -224,7 +224,7 @@ func TestWeakRelationsFiltered(t *testing.T) {
 		}
 	}
 	for _, e := range r.Entries {
-		if e.Standing {
+		if e.Standing && !st.Entries[e.ID].Pinned { // what the user pinned stands, whatever it is
 			t.Errorf("a relation stands: %s", e.ID)
 		}
 	}
