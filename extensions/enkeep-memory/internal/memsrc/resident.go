@@ -31,6 +31,13 @@ const (
 	rankStand = 989 // the first standing entry's rank; the set counts down from it
 	// residentOverhead is what the hub adds to each line ("- " and a line end).
 	residentOverhead = 3
+	// PatternShare is the part of the room the overview's cross-event patterns are offered first (0.2.0-beta.53): a
+	// pattern scores at most 70, so without it the single entries above 70 (hard rules at 90) and the short lines that
+	// fill what is left kept every pattern out (none standing at 1400 bytes, none of the rules side at 4096).
+	PatternShare = 0.25
+	// spillFloor is the least score a line takes the room the other side left with (0.2.0-beta.53): below it the
+	// leftover bytes went to short fragments (a story's character, a one-line self-description).
+	spillFloor = 50
 )
 
 // Candidate is one entry that may stand: a curated entry or an overview pattern, with its score and side.
@@ -43,6 +50,8 @@ type Candidate struct {
 	// too (before, alike scores were ordered by id, a draw by hash).
 	Days int
 	Last string
+	// Pattern marks an overview pattern (ov:pattern:…): offered PatternShare of the room first.
+	Pattern bool
 }
 
 // Resident picks the standing set from cands: the ids in rank order (highest first) with the text each stands with.
@@ -84,17 +93,21 @@ func ResidentWithin(cands []Candidate, total, most int) []Candidate {
 		return false
 	}
 	used := 0
-	pass := func(spill bool) {
+	patterns := int(float64(total) * PatternShare)
+	pass := func(spill, onlyPatterns bool) {
 		for _, c := range cands {
 			if len(chosen) >= most {
 				return
 			}
-			if taken[c.ID] || c.Text == "" || alike(c) {
+			if taken[c.ID] || c.Text == "" || (onlyPatterns && !c.Pattern) || (spill && c.Score < spillFloor) || alike(c) {
 				continue
 			}
 			size := len(c.Text) + residentOverhead
-			if used+size > total {
+			if used+size > total || (onlyPatterns && size > patterns) {
 				continue
+			}
+			if onlyPatterns {
+				patterns -= size
 			}
 			if !spill && size > quota[c.Kind] {
 				continue
@@ -107,8 +120,9 @@ func ResidentWithin(cands []Candidate, total, most int) []Candidate {
 			chosen = append(chosen, c)
 		}
 	}
-	pass(false)
-	pass(true) // what one side left
+	pass(false, true) // the patterns' share, each side within its quota
+	pass(false, false)
+	pass(true, false) // what one side left
 	// Interleave: understanding, rules, understanding… each side by score.
 	var u, r []Candidate
 	for _, c := range chosen {

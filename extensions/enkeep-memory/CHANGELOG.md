@@ -19,6 +19,12 @@ The daily pass looks for the user's own thinking moves first, and the people-and
   role and reports_to) is in the pool again: ranked by its score in recall, fed to the overview and the evaluations,
   never standing. Only noise (about, same_circle) and passing edges (waiting_on, blocked_by, allocated, serves) not
   seen for 14 days are weak: answered last, out of the pool.
+- **Cross-event patterns stand again.** A pattern scores at most 70, so in beta.52 the single entries above it (hard
+  rules at 90) and the short lines filling what was left kept every pattern out of the standing set (none at 1400
+  bytes, none on the rules side at 4096). Patterns are now offered a quarter of the room first, each side within its
+  quota (live copy: 1 of 9 lines at 1400 bytes, 7 of 23 at 4096), and the room one side leaves takes no line scoring
+  under 50 (it went to fragments such as a story character). `enkeep-memory hardeval standing` prints the set and why
+  each pattern is in or out.
 - **Collaboration evaluation.** Incidents are also tagged when avoiding them needs entity relations (mixing up people
   or projects, not knowing who is responsible, missing a dependency), reported in a column of their own; two recall
   arms answer with the standing set plus what the incident's names bring in, with and without the world and people

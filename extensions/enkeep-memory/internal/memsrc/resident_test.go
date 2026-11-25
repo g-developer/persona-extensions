@@ -2,6 +2,7 @@ package memsrc
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -100,5 +101,32 @@ func TestResidentRoom(t *testing.T) {
 	small, wide := len(ResidentWithin(cs, ResidentBytes, ResidentMostFor(ResidentBytes))), len(ResidentWithin(cs, 4096, ResidentMostFor(4096)))
 	if wide <= small {
 		t.Errorf("room 1400: %d lines, 4096: %d", small, wide)
+	}
+}
+
+// The overview's patterns are offered PatternShare of the room first, on their side's quota, although single entries
+// score higher; the leftover room takes no line under spillFloor.
+func TestResidentPatternShare(t *testing.T) {
+	var cs []Candidate
+	for i := 0; i < 20; i++ {
+		c := cand(fmt.Sprint("r", i), entry.KindRules, 90, 120)
+		cs = append(cs, c)
+		u := cand(fmt.Sprint("u", i), entry.KindUnderstanding, 80, 120)
+		cs = append(cs, u)
+	}
+	p := cand("ov:pattern:1", entry.KindUnderstanding, 60, 200)
+	p.Pattern = true
+	low := cand("w-low", entry.KindUnderstanding, 20, 30)
+	cs = append(cs, p, low)
+	got := ResidentWithin(cs, 4096, ResidentMostFor(4096))
+	var ids []string
+	for _, c := range got {
+		ids = append(ids, c.ID)
+	}
+	if !slices.Contains(ids, "ov:pattern:1") {
+		t.Errorf("the pattern was kept out: %v", ids)
+	}
+	if slices.Contains(ids, "w-low") {
+		t.Errorf("a fragment under the floor filled the room: %v", ids)
 	}
 }

@@ -91,7 +91,7 @@ type heQuestions struct {
 
 func hardevalCmd(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: hardeval build|run|collab-build|collab-run [flags]")
+		return errors.New("usage: hardeval build|run|collab-build|collab-run|standing [flags]")
 	}
 	switch args[0] {
 	case "build":
@@ -102,6 +102,8 @@ func hardevalCmd(args []string) error {
 		return collabBuild(args[1:])
 	case "collab-run":
 		return collabRun(args[1:])
+	case "standing":
+		return hardevalStanding(args[1:])
 	}
 	return fmt.Errorf("unknown hardeval step %q", args[0])
 }
@@ -440,7 +442,7 @@ func heMemories(st *store.State, ov *overview.State, cog []string, f heFilter, c
 			lines = append(lines, "- "+overview.Text(p))
 			if k := entry.KindOfFacet(p.Facet); k != "" && !entry.TemplateBacked(st.Entries, p.EvidenceIDs, tpl) {
 				ovCands = append(ovCands, memsrc.Candidate{ID: p.ID, Text: overview.Text(p), Kind: k, Score: overview.Score(p),
-					Days: len(p.EvidenceIDs), Last: p.LastEvidence})
+					Days: len(p.EvidenceIDs), Last: p.LastEvidence, Pattern: true})
 			}
 		}
 	}

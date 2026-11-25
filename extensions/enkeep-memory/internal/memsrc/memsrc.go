@@ -769,7 +769,7 @@ func workStandingSet(st *store.State, extras []Extra, room int) map[string]stand
 			continue
 		}
 		cands = append(cands, Candidate{ID: e.ID, Text: clipBytes(strings.TrimSpace(e.Text), residentTextMost), Kind: x.Kind, Score: x.Score,
-			Days: len(x.Evidence), Last: x.Last})
+			Days: len(x.Evidence), Last: x.Last, Pattern: strings.HasPrefix(e.ID, "ov:pattern:")})
 	}
 	out := map[string]standing{}
 	for i, c := range ResidentWithin(cands, room, ResidentMostFor(room)) {
