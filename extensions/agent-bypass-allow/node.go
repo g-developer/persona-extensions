@@ -209,7 +209,15 @@ func (n *node) install(dirs []string) {
 		case !isDir(abs):
 			s.Error = "no such directory"
 		default:
-			s.Settings = settingsPath(abs)
+			if s.auto {
+				s.Settings, err = n.automaticSettingsPath(abs)
+				if err != nil {
+					s.Error = err.Error()
+					break
+				}
+			} else {
+				s.Settings = settingsPath(abs)
+			}
 			if _, err := installHookWith(s.Settings, cmp.Or(n.matcher, hookMatcher), hookCommand(n.bin, abs, n.data)); err != nil {
 				s.Error = err.Error()
 			} else {
@@ -252,6 +260,27 @@ func (n *node) realAssistantProfile(dir string) bool {
 	}
 	st, err := os.Lstat(dir)
 	return err == nil && st.IsDir() && st.Mode()&os.ModeSymlink == 0
+}
+
+// automaticSettingsPath keeps automatically discovered profiles from editing a
+// settings.json symlink outside their real profile directory. Explicit
+// config_dirs retain settingsPath's symlink-following behavior.
+func (n *node) automaticSettingsPath(dir string) (string, error) {
+	if !n.realAssistantProfile(dir) {
+		return "", fmt.Errorf("not a real assistant profile")
+	}
+	path := filepath.Join(dir, "settings.json")
+	st, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return path, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if st.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("automatic assistant profile settings.json is a symlink")
+	}
+	return path, nil
 }
 
 // installAgy puts the PreToolUse entry into each configured Gemini/Antigravity config directory. When agy_dirs is
@@ -330,17 +359,25 @@ func (n *node) cleanup() {
 		}
 		if i, ok := seen[abs]; ok {
 			if n.dirs[i].Settings == "" {
-				n.dirs[i].Settings = settingsPath(abs)
+				if n.dirs[i].auto {
+					n.dirs[i].Settings = filepath.Join(abs, "settings.json")
+				} else {
+					n.dirs[i].Settings = settingsPath(abs)
+				}
 			}
 			continue
 		}
-		n.dirs = append(n.dirs, dirState{Dir: d, Settings: settingsPath(abs), auto: true})
+		n.dirs = append(n.dirs, dirState{Dir: d, Settings: filepath.Join(abs, "settings.json"), auto: true})
 	}
 	for _, s := range n.dirs {
 		// Only automatic discovery has the no-symlink-escape rule. An explicit
 		// config_dir keeps the extension's existing settings-symlink semantics.
-		if s.auto && !n.realAssistantProfile(s.Dir) {
-			continue
+		if s.auto {
+			settings, err := n.automaticSettingsPath(s.Dir)
+			if err != nil {
+				continue
+			}
+			s.Settings = settings
 		}
 		if s.Settings == "" {
 			continue

@@ -108,3 +108,81 @@ func TestNodeCleanupDoesNotFollowReplacedProfileLink(t *testing.T) {
 		t.Fatal("test control lost the outside hook")
 	}
 }
+
+func TestNodeAutomaticProfileRejectsSettingsLink(t *testing.T) {
+	root := t.TempDir()
+	personaHome := filepath.Join(root, "state", "persona")
+	profile := filepath.Join(personaHome, "profiles", "channel")
+	if err := os.MkdirAll(profile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside.json")
+	const before = "{\n  \"theme\": \"dark\"\n}\n"
+	if err := os.WriteFile(outside, []byte(before), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(profile, "settings.json")); err != nil {
+		t.Fatal(err)
+	}
+	n, _, _ := profileCleanupNode(t, personaHome, []string{"~/.claude"})
+	after, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != before {
+		t.Fatal("installation followed an automatic profile's settings symlink outside the profiles root")
+	}
+	if len(n.dirs) != 2 || n.dirs[1].Installed || n.dirs[1].Error == "" {
+		t.Fatalf("rejected settings symlink did not leave an error status: %+v", n.dirs)
+	}
+}
+
+func TestNodeExplicitProfileKeepsSettingsLink(t *testing.T) {
+	root := t.TempDir()
+	personaHome := filepath.Join(root, "state", "persona")
+	profile := filepath.Join(personaHome, "profiles", "channel")
+	if err := os.MkdirAll(profile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside.json")
+	if err := os.WriteFile(outside, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(profile, "settings.json")); err != nil {
+		t.Fatal(err)
+	}
+	profileCleanupNode(t, personaHome, []string{"~/.claude", profile})
+	if !hasHook(outside) {
+		t.Fatal("an explicit config_dir no longer follows its settings symlink")
+	}
+}
+
+func TestNodeCleanupDoesNotFollowSettingsLink(t *testing.T) {
+	root := t.TempDir()
+	personaHome := filepath.Join(root, "state", "persona")
+	profile := filepath.Join(personaHome, "profiles", "channel")
+	if err := os.MkdirAll(profile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside.json")
+	if _, err := installHookWith(outside, hookMatcher, hookCommand("/opt/extension/seed", profile, filepath.Join(personaHome, "node-plugins", "agent-bypass-allow", "data"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(profile, "settings.json")); err != nil {
+		t.Fatal(err)
+	}
+	n, _, cancel := profileCleanupNode(t, personaHome, []string{"~/.claude"})
+	before, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	n.cleanup()
+	after, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("cleanup followed an automatic profile's settings symlink")
+	}
+}
