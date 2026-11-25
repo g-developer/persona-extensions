@@ -31,9 +31,9 @@ import (
 var todoIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,120}$`)
 
 const (
-	maxPromptBytes     = 32 << 10
+	maxPromptBytes     = 256 << 10
 	maxAcceptanceBytes = 2 << 10
-	maxBodyBytes       = 128 << 10
+	maxBodyBytes       = 512 << 10
 )
 
 type apiError struct {
@@ -114,6 +114,9 @@ type taskView struct {
 	Phase         string     `json:"phase,omitempty"`
 	RunsOn        string     `json:"runs_on,omitempty"`
 	SessionID     string     `json:"session_id,omitempty"`
+	Launcher      string     `json:"launcher,omitempty"`
+	Model         string     `json:"model,omitempty"`
+	Worktree      string     `json:"worktree,omitempty"`
 	Waiting       string     `json:"waiting,omitempty"`
 	NotBefore     *time.Time `json:"not_before,omitempty"`
 	SubmittedAt   time.Time  `json:"submitted_at"`
@@ -153,6 +156,19 @@ func viewTask(t *Task, prompt int) taskView {
 	}
 	if e := t.Exec; e != nil {
 		v.Phase, v.RunsOn, v.SessionID, v.Waiting = e.Phase, e.MachineID, e.SessionID, e.Waiting
+		v.Launcher, v.Model, v.Worktree = e.Launcher, e.Model, e.Worktree
+	} else {
+		if n := len(t.Attempts); n > 0 {
+			att := t.Attempts[n-1]
+			v.Launcher, v.Model, v.SessionID, v.Worktree = att.Launcher, att.Model, att.SessionID, att.Worktree
+		}
+		if n := len(t.Reports); n > 0 {
+			rep := t.Reports[n-1]
+			if len(t.Attempts) == 0 || rep.AttemptNo == t.Attempts[len(t.Attempts)-1].AttemptNo {
+				v.Launcher, v.Model = cmpOr(v.Launcher, rep.Launcher), cmpOr(v.Model, rep.Model)
+				v.SessionID, v.Worktree = cmpOr(v.SessionID, rep.SessionID), cmpOr(v.Worktree, rep.Worktree)
+			}
+		}
 	}
 	switch prompt {
 	case promptFull:
@@ -175,6 +191,7 @@ type attemptView struct {
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 	ExitCode   *int       `json:"exit_code,omitempty"`
+	Dirty      bool       `json:"dirty,omitempty"`
 	ErrorClass string     `json:"error_class,omitempty"`
 	Verdict    string     `json:"verdict,omitempty"`
 	Summary    string     `json:"summary,omitempty"`
@@ -184,7 +201,7 @@ func viewAttempts(atts []Attempt) []attemptView {
 	out := make([]attemptView, 0, len(atts))
 	for _, a := range atts {
 		out = append(out, attemptView{AttemptNo: a.AttemptNo, State: a.State, Machine: a.Machine, ModelTier: a.ModelTier,
-			StartedAt: a.StartedAt, FinishedAt: a.FinishedAt, ExitCode: a.ExitCode, ErrorClass: a.ErrorClass, Verdict: a.Verdict, Summary: a.Summary})
+			StartedAt: a.StartedAt, FinishedAt: a.FinishedAt, ExitCode: a.ExitCode, Dirty: a.Dirty, ErrorClass: a.ErrorClass, Verdict: a.Verdict, Summary: a.Summary})
 	}
 	return out
 }
@@ -335,6 +352,10 @@ type evidenceView struct {
 	Acceptance      string          `json:"acceptance,omitempty"`
 	DecisionRef     string          `json:"decision_ref,omitempty"`
 	DecisionSkipped string          `json:"decision_skipped,omitempty"`
+	Launcher        string          `json:"launcher,omitempty"`
+	Model           string          `json:"model,omitempty"`
+	SessionID       string          `json:"session_id,omitempty"`
+	Worktree        string          `json:"worktree,omitempty"`
 	LastReport      *reportView     `json:"last_report,omitempty"`
 	Report          *EvidenceReport `json:"report,omitempty"` // attempt=N: that attempt's report as stored
 }
@@ -347,6 +368,7 @@ type reportView struct {
 	Verdict    string     `json:"verdict,omitempty"`
 	ErrorClass string     `json:"error_class,omitempty"`
 	ExitCode   *int       `json:"exit_code,omitempty"`
+	Dirty      bool       `json:"dirty,omitempty"`
 	Summary    string     `json:"summary,omitempty"`
 	Artifacts  []Artifact `json:"artifacts,omitempty"`
 	Message    string     `json:"message,omitempty"`
@@ -357,7 +379,7 @@ type reportView struct {
 
 func viewReport(r EvidenceReport) *reportView {
 	v := &reportView{AttemptNo: r.AttemptNo, Outcome: r.Outcome, Verdict: r.Verdict, ErrorClass: r.ErrorClass, ExitCode: r.ExitCode,
-		Summary: r.Summary, Artifacts: r.Artifacts, ReceivedAt: r.ReceivedAt}
+		Dirty: r.Dirty, Summary: r.Summary, Artifacts: r.Artifacts, ReceivedAt: r.ReceivedAt}
 	// With no acceptance command the message of a success is the agent's whole reply, which the summary is taken from.
 	if !(r.Outcome == StateSucceeded && r.ExitCode == nil && strings.TrimSpace(r.Summary) != "") {
 		v.Message = outputEnd(r.Message, evidenceTailRunes)
@@ -401,8 +423,14 @@ func (a *atsApp) getEvidence(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, &apiError{Code: "no_report", Msg: fmt.Sprintf("attempt %d of this task has no report (it has %d attempts)", n, len(t.Attempts))})
 			return
 		}
-	} else if n := len(t.Reports); n > 0 {
-		out.LastReport = viewReport(t.Reports[n-1])
+	} else {
+		if len(t.Attempts) > 0 || len(t.Reports) > 0 {
+			v := viewTask(t, promptNone)
+			out.Launcher, out.Model, out.SessionID, out.Worktree = v.Launcher, v.Model, v.SessionID, v.Worktree
+		}
+		if n := len(t.Reports); n > 0 {
+			out.LastReport = viewReport(t.Reports[n-1])
+		}
 	}
 	writeJSON(w, http.StatusOK, out)
 }

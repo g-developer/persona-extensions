@@ -239,3 +239,47 @@ func TestNodeRPCNamesItsMethods(t *testing.T) {
 		t.Fatal("an unknown method was answered")
 	}
 }
+
+func TestPrepareFetchesMissingRefFromRemote(t *testing.T) {
+	tmp, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bare := filepath.Join(tmp, "origin.git")
+	cloneA := filepath.Join(tmp, "cloneA")
+	cloneB := filepath.Join(tmp, "cloneB")
+
+	runGit(t, tmp, "init", "--bare", "-q", bare)
+	runGit(t, tmp, "clone", "-q", bare, cloneA)
+	if err := os.WriteFile(filepath.Join(cloneA, "README.md"), []byte("init\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, cloneA, "add", ".")
+	runGit(t, cloneA, "commit", "-q", "-m", "init")
+	runGit(t, cloneA, "push", "-q", "origin", "HEAD:main")
+
+	runGit(t, tmp, "clone", "-q", bare, cloneB)
+
+	// Push a new commit on an uncloned branch from cloneA so cloneB does not have it yet.
+	runGit(t, cloneA, "checkout", "-q", "-b", "review/round-05")
+	if err := os.WriteFile(filepath.Join(cloneA, "round5.txt"), []byte("round5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, cloneA, "add", ".")
+	runGit(t, cloneA, "commit", "-q", "-m", "round 5")
+	wantSHA := runGit(t, cloneA, "rev-parse", "HEAD")
+	runGit(t, cloneA, "push", "-q", "origin", "review/round-05")
+
+	w, _ := newTestWorker(t, tmp)
+	res, err := w.prepare(t.Context(), prepareParams{TaskID: "task_fetch", Attempt: 1, Repo: cloneB, Ref: wantSHA, Readonly: true})
+	if err != nil {
+		t.Fatalf("prepare should auto-fetch missing ref %s: %v", wantSHA, err)
+	}
+	if res.BaseSHA != wantSHA {
+		t.Fatalf("got BaseSHA %s, want %s", res.BaseSHA, wantSHA)
+	}
+	data, err := os.ReadFile(filepath.Join(res.Path, "round5.txt"))
+	if err != nil || string(data) != "round5\n" {
+		t.Fatalf("fetched worktree missing round5.txt: err=%v data=%q", err, string(data))
+	}
+}

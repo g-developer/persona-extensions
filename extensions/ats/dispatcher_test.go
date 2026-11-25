@@ -619,3 +619,90 @@ func TestUpdateExecRollsBackInMemoryStateOnSaveError(t *testing.T) {
 		t.Fatalf("UpdateExec left dirty in-memory state after save failure: %+v", got.Exec)
 	}
 }
+
+func TestReadonlyTaskAutoDeclinesExitPlanMode(t *testing.T) {
+	t.Run("readonly auto-declines plan exit up to limit and succeeds", func(t *testing.T) {
+		r := newRig(t)
+		task := r.enqueue(EnqueueInput{Title: "Readonly plan guard"})
+		r.tick()
+
+		for i := 1; i <= maxReadonlyPlanDeclines; i++ {
+			ixID := "ix_plan_" + string(rune('0'+i))
+			r.hub.mu.Lock()
+			r.hub.interactions = []hubInteraction{{
+				ID: ixID, MachineID: testMachine, SessionID: "session-1",
+				Kind: "plan", ToolName: "ExitPlanMode",
+			}}
+			r.hub.sessions["session-1"].State = "needs_you"
+			r.hub.sessions["session-1"].PendingInteractions = 1
+			r.hub.mu.Unlock()
+
+			r.tick()
+			got := r.task(task.ID)
+			if got.State != StateRunning {
+				t.Fatalf("decline %d moved task to %s (%+v)", i, got.State, got.Exec)
+			}
+		}
+
+		r.hub.mu.Lock()
+		resolvedCount := len(r.hub.resolved)
+		firstRes := r.hub.resolved[0]
+		r.hub.mu.Unlock()
+		if resolvedCount != maxReadonlyPlanDeclines {
+			t.Fatalf("resolved %d interactions, want %d", resolvedCount, maxReadonlyPlanDeclines)
+		}
+		if firstRes.Res.Approve == nil || *firstRes.Res.Approve {
+			t.Fatalf("expected approve=false, got %+v", firstRes.Res)
+		}
+
+		// Exceeding maxReadonlyPlanDeclines falls back to needs_input.
+		r.hub.mu.Lock()
+		r.hub.interactions = []hubInteraction{{
+			ID: "ix_plan_over", MachineID: testMachine, SessionID: "session-1",
+			Kind: "plan", ToolName: "ExitPlanMode",
+		}}
+		r.hub.sessions["session-1"].State = "needs_you"
+		r.hub.sessions["session-1"].PendingInteractions = 1
+		r.hub.mu.Unlock()
+
+		r.tick()
+		if got := r.task(task.ID); got.State != StateNeedsInput || got.Exec.Waiting != "Agent 提交了计划，等你批准" {
+			t.Fatalf("after limit: state=%s waiting=%q", got.State, got.Exec.Waiting)
+		}
+
+		// Manual approval resumes and finishes cleanly.
+		r.hub.turnEnds("session-1", "u2", "Done after staying in plan mode.")
+		r.tick()
+		r.tick()
+		if got := r.task(task.ID); got.State != StateSucceeded {
+			t.Fatalf("final state: %s", got.State)
+		}
+	})
+
+	t.Run("writable task with plan card enters needs_input without auto-decline", func(t *testing.T) {
+		r := newRig(t)
+		task := r.enqueue(EnqueueInput{Title: "Writable plan", PermissionProfile: PermissionDefault})
+		r.tick()
+
+		r.hub.mu.Lock()
+		r.hub.interactions = []hubInteraction{{
+			ID: "ix_write_plan", MachineID: testMachine, SessionID: "session-1",
+			Kind: "plan", ToolName: "ExitPlanMode",
+		}}
+		r.hub.sessions["session-1"].State = "needs_you"
+		r.hub.sessions["session-1"].PendingInteractions = 1
+		r.hub.mu.Unlock()
+
+		r.tick()
+		got := r.task(task.ID)
+		if got.State != StateNeedsInput || got.Exec.Waiting != "Agent 提交了计划，等你批准" {
+			t.Fatalf("writable task: state=%s waiting=%q", got.State, got.Exec.Waiting)
+		}
+		r.hub.mu.Lock()
+		resolvedCount := len(r.hub.resolved)
+		r.hub.mu.Unlock()
+		if resolvedCount != 0 {
+			t.Fatalf("writable task should not auto-decline ExitPlanMode, got %d resolves", resolvedCount)
+		}
+	})
+}

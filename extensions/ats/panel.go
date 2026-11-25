@@ -38,6 +38,7 @@ type ExtConfig struct {
 	MaxQueued            int      `json:"max_queued"`
 	MaxRetries           int      `json:"max_retries"`
 	ReserveHeadroomPct   int      `json:"reserve_headroom_pct"`
+	Launcher             string   `json:"launcher"`
 	ModelFast            string   `json:"model_fast"`
 	ModelStandard        string   `json:"model_standard"`
 	ModelStrong          string   `json:"model_strong"`
@@ -86,6 +87,34 @@ func (c ExtConfig) model(tier string) string {
 		return strings.TrimSpace(c.ModelStrong)
 	}
 	return strings.TrimSpace(c.ModelStandard)
+}
+
+// launcherFor picks the launcher for machineID from Launcher, supporting either a single launcher name
+// or comma/semicolon/newline-separated entries such as "default-claude,workstation=local-claude".
+func (c ExtConfig) launcherFor(machineID string) string {
+	target := strings.TrimSpace(machineID)
+	parts := strings.FieldsFunc(c.Launcher, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n'
+	})
+	fallback := ""
+	for _, raw := range parts {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		if k, v, ok := strings.Cut(entry, "="); ok {
+			k = strings.TrimSpace(k)
+			v = strings.TrimSpace(v)
+			if k != "" && strings.EqualFold(k, target) {
+				return v
+			}
+			continue
+		}
+		if fallback == "" {
+			fallback = entry
+		}
+	}
+	return fallback
 }
 
 func (c ExtConfig) queueConfig() QueueConfig {

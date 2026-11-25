@@ -147,6 +147,14 @@ type Attempt struct {
 	WorkerID       string     `json:"worker_id"`
 	Machine        string     `json:"machine,omitempty"`
 	ModelTier      string     `json:"model_tier,omitempty"`
+	Launcher       string     `json:"launcher,omitempty"`
+	Model          string     `json:"model,omitempty"`
+	SessionID      string     `json:"session_id,omitempty"`
+	Worktree       string     `json:"worktree,omitempty"`
+	BaseSHA        string     `json:"base_sha,omitempty"`
+	HeadSHA        string     `json:"head_sha,omitempty"`
+	Dirty          bool       `json:"dirty,omitempty"`
+	FullReply      string     `json:"full_reply,omitempty"`
 	Harness        string     `json:"harness,omitempty"`
 	State          string     `json:"state"`
 	LeasedAt       time.Time  `json:"leased_at"`
@@ -172,6 +180,14 @@ type EvidenceReport struct {
 	ErrorClass string    `json:"error_class,omitempty"`
 	ExitCode   *int      `json:"exit_code,omitempty"`
 	Message    string    `json:"message,omitempty"`
+	Launcher   string    `json:"launcher,omitempty"`
+	Model      string    `json:"model,omitempty"`
+	SessionID  string    `json:"session_id,omitempty"`
+	Worktree   string    `json:"worktree,omitempty"`
+	BaseSHA    string    `json:"base_sha,omitempty"`
+	HeadSHA    string    `json:"head_sha,omitempty"`
+	Dirty      bool      `json:"dirty,omitempty"`
+	FullReply  string    `json:"full_reply,omitempty"`
 	// Summary is the end of the agent's last reply in this attempt: what it says it did and found.
 	Summary   string     `json:"summary,omitempty"`
 	Artifacts []Artifact `json:"artifacts,omitempty"`
@@ -237,6 +253,11 @@ type Execution struct {
 	Branch     string    `json:"branch,omitempty"`
 	BaseSHA    string    `json:"base_sha,omitempty"`
 	SessionID  string    `json:"session_id,omitempty"`
+	Launcher   string    `json:"launcher,omitempty"`
+	Model      string    `json:"model,omitempty"`
+	HeadSHA    string    `json:"head_sha,omitempty"`
+	Dirty      bool      `json:"dirty,omitempty"`
+	FullReply  string    `json:"full_reply,omitempty"`
 	// SeenUpdate is the session's updated_at at the last poll that found its turn over, and Stable how many
 	// polls in a row found it so: the hub reports a finished turn for a moment between an agent's steps.
 	SeenUpdate string `json:"seen_update,omitempty"`
@@ -565,6 +586,14 @@ type CompleteAttemptInput struct {
 	ExitCode   *int
 	Message    string
 	Summary    string // the end of the agent's last reply
+	Launcher   string `json:"launcher,omitempty"`
+	Model      string `json:"model,omitempty"`
+	SessionID  string `json:"session_id,omitempty"`
+	Worktree   string `json:"worktree,omitempty"`
+	BaseSHA    string `json:"base_sha,omitempty"`
+	HeadSHA    string `json:"head_sha,omitempty"`
+	Dirty      bool   `json:"dirty,omitempty"`
+	FullReply  string `json:"full_reply,omitempty"`
 	Artifacts  []Artifact
 	Retryable  *bool
 	Now        time.Time
@@ -1142,6 +1171,14 @@ func (q *Queue) CompleteAttempt(in CompleteAttemptInput) (*Task, error) {
 		ExitCode:   in.ExitCode,
 		Message:    in.Message,
 		Summary:    in.Summary,
+		Launcher:   in.Launcher,
+		Model:      in.Model,
+		SessionID:  in.SessionID,
+		Worktree:   in.Worktree,
+		BaseSHA:    in.BaseSHA,
+		HeadSHA:    in.HeadSHA,
+		Dirty:      in.Dirty,
+		FullReply:  in.FullReply,
 		Artifacts:  slices.Clone(in.Artifacts),
 	}
 	t.Reports = append(t.Reports, rep)
@@ -1151,6 +1188,8 @@ func (q *Queue) CompleteAttempt(in CompleteAttemptInput) (*Task, error) {
 	att.ExitCode = in.ExitCode
 	att.ErrorClass = in.ErrorClass
 	att.Verdict = verdict
+	att.Launcher, att.Model, att.SessionID, att.Worktree = in.Launcher, in.Model, in.SessionID, in.Worktree
+	att.BaseSHA, att.HeadSHA, att.Dirty, att.FullReply = in.BaseSHA, in.HeadSHA, in.Dirty, in.FullReply
 	att.Summary = firstLinePreview(in.Message, 200)
 	t.Summary = att.Summary
 

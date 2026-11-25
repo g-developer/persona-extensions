@@ -179,6 +179,33 @@ func cleanEnv() []string {
 	return env
 }
 
+// resolveCommit finds ref in repo, fetching configured remotes if the commit is missing locally so
+// multi-machine tasks sharing a Git remote can run seamlessly on another node.
+func resolveCommit(ctx context.Context, repo, ref string) (string, error) {
+	if sha, err := git(ctx, repo, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err == nil && sha != "" {
+		return sha, nil
+	}
+	remotes, err := git(ctx, repo, "remote")
+	if err != nil || strings.TrimSpace(remotes) == "" {
+		return "", fmt.Errorf("ref_not_found: %s names no commit in the repository", ref)
+	}
+	_, _ = git(ctx, repo, "fetch", "--all", "--prune", "--quiet")
+	if sha, err := git(ctx, repo, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err == nil && sha != "" {
+		return sha, nil
+	}
+	if ref != "HEAD" {
+		if _, ferr := git(ctx, repo, "fetch", "--quiet", "origin", ref); ferr == nil {
+			if sha, err := git(ctx, repo, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err == nil && sha != "" {
+				return sha, nil
+			}
+			if sha, err := git(ctx, repo, "rev-parse", "--verify", "--quiet", "FETCH_HEAD^{commit}"); err == nil && sha != "" {
+				return sha, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("ref_not_found: %s names no commit in the repository", ref)
+}
+
 func (n *nodeWorker) prepare(ctx context.Context, p prepareParams) (prepareResult, error) {
 	key, err := attemptKey(p.TaskID, p.Attempt)
 	if err != nil {
@@ -195,9 +222,9 @@ func (n *nodeWorker) prepare(ctx context.Context, p prepareParams) (prepareResul
 	if strings.HasPrefix(ref, "-") {
 		return prepareResult{}, errors.New("ref must be a commit-ish that does not start with -")
 	}
-	sha, err := git(ctx, repo, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
-	if err != nil || sha == "" {
-		return prepareResult{}, fmt.Errorf("ref_not_found: %s names no commit in the repository", ref)
+	sha, err := resolveCommit(ctx, repo, ref)
+	if err != nil {
+		return prepareResult{}, err
 	}
 	path := n.worktree(key)
 	res := prepareResult{Path: path, BaseSHA: sha}

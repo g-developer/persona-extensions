@@ -7,11 +7,11 @@ description: 查待办背后 ATS 任务的进度、卡点和验收证据，或�
 
 ATS 是 Agent 任务队列：每个任务在用户选的电脑上、仓库的独立 git 工作目录里跑一个 Agent 会话，跑完执行验收命令，结论写回待办；一个待办可有多个任务。
 
-命令 `ats METHOD PATH [JSON]`：GET 直接执行，`POST /tasks` 每次先问用户。
+命令 `ats METHOD PATH [JSON | @文件]`：GET 直接执行，`POST /tasks` 每次先问用户。
 
 - `ats GET '/tasks?todo_id=<待办 id>'`：列任务，可加 `state=`（逗号分隔，取值见第 1 条）、`priority=p0..p3`、`limit=`（默认 20）；有 `next` 就加 `after=<next>` 翻页。列表省略默认值（p2、只读、`claude`、首次尝试），仓库、验收命令见单个任务
 - `ats GET /tasks/<id>`：单个任务（长 `prompt` 只给开头，全文加 `?view=full`）；`ats GET /tasks/<id>/evidence`：证据
-- `ats POST /tasks '<JSON>'`：派任务
+- `ats POST /tasks '<JSON>'`：派任务。也可传 `@/绝对路径` 原样发送文件
 
 1. 进度按 `state`：`queued` 排队（有 `not_before` 是失败后等重试）；`running`，`phase` 为 `preparing` 准备、`working` 在做、`accepting` 跑验收；`needs_input` 要用户去该 Agent 会话回答或批准（等什么见 `waiting`）；`succeeded`、`failed`、`canceled`。列表的 `scheduler`：队列档位和剩余额度。
 2. 做完没只看 `/evidence`：`verified` 为 true（`succeeded` 且 `verdict` 为 `pass`）才算通过验收；`succeeded` 但 `verdict` 为 `unverified` 只能说「跑完了、没验收」。`last_report` 含验收退出码、Agent 总结 `summary`、分支和提交、输出末尾 `message`；第 N 次的完整报告加 `?attempt=N`。

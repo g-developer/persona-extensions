@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -109,6 +112,183 @@ func TestPostTaskCanChooseAnEngine(t *testing.T) {
 	if replay.Status != http.StatusOK || replay.Body["created"] != false || taskOf(t, replay)["agent_type"] != AgentCodex ||
 		taskOf(t, replay)["id"] != taskOf(t, first)["id"] {
 		t.Fatalf("engine-changing replay: %d %v", replay.Status, replay.Body)
+	}
+}
+
+func TestPostTaskAcceptsLargePromptsAndBodies(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		prompt string
+	}{
+		{name: "256 KiB prompt", prompt: strings.Repeat("x", 256<<10)},
+		{name: "escaped JSON near 512 KiB", prompt: strings.Repeat("\"", (256<<10)-256)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newTestApp(t)
+			body, err := json.Marshal(map[string]string{"todo_id": "todo_1", "prompt": tc.prompt, "repo": "/srv/code/app"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ans := call(t, a, "POST", "/tasks", string(body))
+			if ans.Status != http.StatusCreated {
+				t.Fatalf("large task: %d %v", ans.Status, ans.Body)
+			}
+			id := taskOf(t, ans)["id"].(string)
+			if got := taskOf(t, call(t, a, "GET", "/tasks/"+id+"?view=full", ""))["prompt"]; got != tc.prompt {
+				t.Fatal("the prompt was not preserved")
+			}
+		})
+	}
+}
+
+func TestTasksAndEvidencePreserveFullReplyAndExecutionMetadata(t *testing.T) {
+	for _, acceptance := range []string{"printf checked", ""} {
+		t.Run(cmpOr(acceptance, "no acceptance"), func(t *testing.T) {
+			r := newRig(t)
+			r.cfg.Launcher, r.cfg.ModelStandard = " provider ", " requested-model "
+			task := r.enqueue(EnqueueInput{PermissionProfile: PermissionDefault, AcceptanceCommand: acceptance})
+			r.tick()
+			running := r.task(task.ID)
+			if running.Exec == nil {
+				t.Fatal("the task did not start")
+			}
+			e := running.Exec
+			a := newATSApp(r.q)
+			want := map[string]any{"launcher": "provider", "model": "requested-model", "session_id": e.SessionID, "worktree": e.Worktree}
+			assertFields := func(got map[string]any, fields map[string]any) {
+				t.Helper()
+				for key, value := range fields {
+					if got[key] != value {
+						t.Errorf("%s: got %.100v, want %.100v", key, got[key], value)
+					}
+				}
+			}
+			if req := r.hub.created[0]; req.Launcher != "provider" || req.Model != "requested-model" {
+				t.Fatalf("session request: %+v", req)
+			}
+			reload := func() {
+				t.Helper()
+				q, err := NewQueue(filepath.Dir(r.q.dataFile), r.q.Config())
+				if err != nil {
+					t.Fatal(err)
+				}
+				r.q, r.d.q, a = q, q, newATSApp(q)
+			}
+			one := call(t, a, "GET", "/tasks/"+task.ID+"?view=full", "")
+			assertFields(taskOf(t, one), want)
+			assertFields(one.Body["attempts"].([]any)[0].(map[string]any), want)
+			assertFields(call(t, a, "GET", "/tasks/"+task.ID+"/evidence", "").Body, want)
+
+			head := ""
+			if acceptance != "" {
+				if err := os.WriteFile(e.Worktree+"/done.txt", []byte("committed\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				runGit(t, e.Worktree, "add", ".")
+				runGit(t, e.Worktree, "commit", "-q", "-m", "work")
+				head = runGit(t, e.Worktree, "rev-parse", "HEAD")
+				if err := os.WriteFile(e.Worktree+"/done.txt", []byte("uncommitted\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reply := "\n" + strings.Repeat("字", 1600) + "\n完整结尾\n"
+			r.hub.set(e.SessionID, func(s *hubSession) { s.Model = " actual-model " })
+			r.hub.turnEnds(e.SessionID, "u1", reply)
+			r.tick()
+			r.tick()
+			want["model"] = "actual-model"
+			if acceptance != "" {
+				reload()
+				if exec := r.task(task.ID).Exec; exec == nil || exec.FullReply != reply || exec.LastReply != agentSummary(reply) {
+					t.Fatal("acceptance did not retain the complete reply and its separate summary after reload")
+				}
+				assertFields(taskOf(t, call(t, a, "GET", "/tasks/"+task.ID, "")), want)
+				r.waitAccepted(task.ID, 1)
+				r.tick()
+			}
+			if got := r.task(task.ID); got.State != StateSucceeded {
+				t.Fatalf("task did not finish: %s", got.State)
+			}
+			reload()
+			one = call(t, a, "GET", "/tasks/"+task.ID+"?view=full", "")
+			assertFields(taskOf(t, one), want)
+			ev := call(t, a, "GET", "/tasks/"+task.ID+"/evidence", "")
+			assertFields(ev.Body, want)
+			if _, has := ev.Body["last_report"].(map[string]any)["full_reply"]; has {
+				t.Fatal("the compact report carried the full reply")
+			}
+			want["full_reply"], want["base_sha"] = reply, e.BaseSHA
+			if acceptance != "" {
+				want["head_sha"], want["dirty"] = head, true
+			}
+			assertFields(one.Body["attempts"].([]any)[0].(map[string]any), want)
+			report := call(t, a, "GET", "/tasks/"+task.ID+"/evidence?attempt=1", "").Body["report"].(map[string]any)
+			assertFields(report, want)
+			if summary, ok := report["summary"].(string); !ok || summary == reply || len([]rune(summary)) > 1201 {
+				t.Fatal("the report should keep a bounded summary separately from the complete reply")
+			}
+			copy := r.task(task.ID)
+			copy.Attempts[0].FullReply, copy.Reports[0].FullReply = "changed", "changed"
+			assertFields(call(t, a, "GET", "/tasks/"+task.ID+"?view=full", "").Body["attempts"].([]any)[0].(map[string]any), want)
+			assertFields(call(t, a, "GET", "/tasks/"+task.ID+"/evidence?attempt=1", "").Body["report"].(map[string]any), want)
+		})
+	}
+}
+
+func TestATSScriptSendsInlineAndFileBodies(t *testing.T) {
+	body := "{\n  \"prompt\": \"完整说明\"\n}\n"
+	received := make(chan string, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" || r.URL.Path != "/tasks" || r.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("request: %s %s %s", r.Method, r.URL.Path, r.Header.Get("Content-Type"))
+		}
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		received <- string(data)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	file := filepath.Join(t.TempDir(), "body with spaces.json")
+	if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, arg := range []string{body, "@" + file} {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cmd := exec.CommandContext(ctx, "bash", "skills/ats-todo/scripts/api.sh", "POST", "/tasks", arg)
+		cmd.Env = append(os.Environ(), "ATS_BASE="+srv.URL)
+		out, err := cmd.CombinedOutput()
+		cancel()
+		if err != nil {
+			t.Fatalf("body submission: %v %s", err, out)
+		}
+		select {
+		case got := <-received:
+			if got != body {
+				t.Fatal("the script changed the submitted body")
+			}
+		default:
+			t.Fatal("the script did not submit a body")
+		}
+	}
+	if err := os.Chmod(file, 0); err != nil {
+		t.Fatal(err)
+	}
+	invalidFiles := []string{"@" + file + ".missing"}
+	if os.Geteuid() != 0 {
+		invalidFiles = append(invalidFiles, "@"+file)
+	}
+	for _, arg := range invalidFiles {
+		cmd := exec.Command("bash", "skills/ats-todo/scripts/api.sh", "POST", "/tasks", arg)
+		cmd.Env = append(os.Environ(), "ATS_BASE="+srv.URL)
+		var stdout, stderr strings.Builder
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 1 || stdout.Len() != 0 || stderr.Len() == 0 {
+			t.Fatalf("invalid body file: %v stdout %q stderr %q", err, stdout.String(), stderr.String())
+		}
 	}
 }
 
@@ -433,6 +613,7 @@ func TestManifest(t *testing.T) {
 	// The defaults the settings show are the ones the program uses when nothing is set.
 	def := defaultExtConfig()
 	for key, want := range map[string]any{
+		"launcher":              def.Launcher,
 		"write_permission_mode": def.WritePermissionMode, "parallel_per_machine": float64(def.ParallelPerMachine),
 		"task_timeout_minutes": float64(def.TaskTimeoutMinutes), "acceptance_timeout_minutes": float64(def.AcceptTimeoutMinutes),
 		"max_queued": float64(def.MaxQueued), "max_retries": float64(def.MaxRetries), "reserve_headroom_pct": float64(def.ReserveHeadroomPct),
