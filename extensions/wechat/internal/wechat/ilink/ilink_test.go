@@ -3,10 +3,13 @@ package ilink
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -61,6 +64,33 @@ func (f *fake) client(token, base string) *Client {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func TestErrorType(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "dns", err: &Error{Code: CodeNetwork, err: &url.Error{Err: &net.DNSError{Name: "example.invalid"}}}, want: "dns"},
+		{name: "tcp", err: &Error{Code: CodeNetwork, err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("refused")}}, want: "tcp"},
+		{name: "tls", err: &Error{Code: CodeNetwork, err: &tls.RecordHeaderError{Msg: "bad record"}}, want: "tls"},
+		{name: "network timeout", err: &Error{Code: CodeNetwork, err: &net.OpError{Err: context.DeadlineExceeded}}, want: "timeout"},
+		{name: "client timeout", err: &Error{Code: CodeTimeout}, want: "timeout"},
+		{name: "cancelled", err: context.Canceled, want: "aborted"},
+		{name: "aborted", err: &Error{Code: CodeAborted}, want: "aborted"},
+		{name: "http", err: &Error{Code: CodeHTTP}, want: "http"},
+		{name: "other network", err: &Error{Code: CodeNetwork, err: errors.New("unknown")}, want: "network"},
+		{name: "other", err: errors.New("unknown"), want: "unknown"},
+		{name: "nil", err: nil, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ErrorType(tt.err); got != tt.want {
+				t.Errorf("ErrorType(%v) = %q, want %q", tt.err, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestValidateBaseURL(t *testing.T) {
@@ -192,6 +222,8 @@ func TestGetUpdates(t *testing.T) {
 						"ref_msg": map[string]any{"title": "引用", "message_item": map[string]any{"type": 1, "text_item": map[string]any{"text": "原文"}}}},
 					map[string]any{"type": 3, "voice_item": map[string]any{"text": "语音转写", "media": map[string]any{"encrypt_query_param": "q", "aes_key": "k"}}},
 					map[string]any{"type": 2, "image_item": map[string]any{"aeskey": "00112233445566778899aabbccddeeff", "media": map[string]any{"full_url": "https://novac2c.cdn.weixin.qq.com/x"}}},
+					map[string]any{"type": 4, "file_item": map[string]any{"file_name": "report.pdf", "len": "123", "media": map[string]any{"encrypt_query_param": "fq", "aes_key": "file-key"}}},
+					map[string]any{"type": 5, "video_item": map[string]any{"media": map[string]any{"encrypt_query_param": "vq", "aes_key": "video-key"}}},
 				}},
 			map[string]any{"client_id": "c-1", "from_user_id": "x", "context_token": "CT2", "item_list": []any{}},
 			map[string]any{"message_id": "7", "from_user_id": "bot@im", "context_token": "CT", "message_type": 2},
@@ -210,7 +242,9 @@ func TestGetUpdates(t *testing.T) {
 	if m.ID != "message:42" || m.From != "owner@im" || m.ContextToken != "CT" || m.Text != "你好\n语音转写" || m.Quote != "引用\n原文" || m.At != 1000 {
 		t.Errorf("message %+v", m)
 	}
-	if len(m.Media) != 2 || m.Media[0].Kind != MediaVoice || m.Media[1].Kind != MediaImage || m.Media[1].KeyHex == "" {
+	if len(m.Media) != 4 || m.Media[0].Kind != MediaVoice || m.Media[1].Kind != MediaImage || m.Media[1].KeyHex == "" ||
+		m.Media[2] != (Media{Kind: MediaFile, Query: "fq", KeyB64: "file-key", FileName: "report.pdf", Size: 123}) ||
+		m.Media[3] != (Media{Kind: MediaVideo, Query: "vq", KeyB64: "video-key"}) {
 		t.Errorf("media %+v", m.Media)
 	}
 	if p.Messages[1].ID != "client:c-1" {
@@ -227,6 +261,19 @@ func TestGetUpdatesTimeoutKeepsCursor(t *testing.T) {
 	})
 	if _, err := f.client("BT", "").GetUpdates(context.Background(), "C"); CodeOf(err) != CodeProtocol || !Retryable(err) {
 		t.Errorf("ret -1: %v", err)
+	}
+}
+
+func TestSendTextParentDeadlineIsTimeout(t *testing.T) {
+	f := newFake(t, func(w http.ResponseWriter, r *http.Request, _ map[string]any) {
+		t.Error("an already-expired parent deadline should not reach the server")
+		writeJSON(w, map[string]any{"ret": 0})
+	})
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	err := f.client("BT", "").SendText(ctx, "owner@im", "CT", "cid", "回答")
+	if CodeOf(err) != CodeTimeout || ErrorType(err) != "timeout" {
+		t.Fatalf("parent deadline: code=%q type=%q err=%v", CodeOf(err), ErrorType(err), err)
 	}
 }
 
@@ -285,9 +332,9 @@ func TestDownload(t *testing.T) {
 	})
 	c := f.client("BT", "")
 	for _, m := range []Media{
-		{Query: "Q", KeyHex: hex.EncodeToString(key)},
-		{Query: "Q", KeyB64: base64.StdEncoding.EncodeToString(key)},
-		{Query: "Q", KeyB64: base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(key)))},
+		{Kind: MediaFile, Query: "Q", KeyHex: hex.EncodeToString(key)},
+		{Kind: MediaVideo, Query: "Q", KeyB64: base64.StdEncoding.EncodeToString(key)},
+		{Kind: MediaFile, Query: "Q", KeyB64: base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(key)))},
 	} {
 		got, err := c.Download(context.Background(), m)
 		if err != nil || !bytes.Equal(got, plain) {
@@ -302,6 +349,41 @@ func TestDownload(t *testing.T) {
 	}
 	if _, err := DecryptECB(enc[:16], key); err == nil {
 		t.Error("bad padding accepted")
+	}
+}
+
+func TestDownloadFileAndVideoSizeLimits(t *testing.T) {
+	key, _ := hex.DecodeString("00112233445566778899aabbccddeeff")
+	tests := []struct {
+		name, query string
+		kind        MediaKind
+		size        int
+		ok          bool
+	}{
+		{name: "file at the message budget", query: "at", kind: MediaFile, size: 40 << 20, ok: true},
+		{name: "one byte over", query: "over", kind: MediaFile, size: 40<<20 + 1},
+		{name: "video over the picture limit", query: "video", kind: MediaVideo, size: 9 << 20, ok: true},
+	}
+	downloads := map[string][]byte{}
+	for _, tt := range tests {
+		enc, err := EncryptECB(make([]byte, tt.size), key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		downloads[tt.query] = enc
+	}
+	f := newFake(t, func(w http.ResponseWriter, r *http.Request, _ map[string]any) {
+		_, _ = w.Write(downloads[r.URL.Query().Get("encrypted_query_param")])
+	})
+	c := f.client("BT", "")
+	for _, tt := range tests {
+		got, err := c.Download(context.Background(), Media{Kind: tt.kind, Query: tt.query, KeyB64: base64.StdEncoding.EncodeToString(key)})
+		if tt.ok && (err != nil || len(got) != tt.size) {
+			t.Errorf("%s: decrypted %d bytes, want %d; error=%v", tt.name, len(got), tt.size, err)
+		}
+		if !tt.ok && (err == nil || CodeOf(err) != CodeBadResponse || got != nil) {
+			t.Errorf("%s: decrypted %d bytes, error=%v; want media-too-large rejection", tt.name, len(got), err)
+		}
 	}
 }
 

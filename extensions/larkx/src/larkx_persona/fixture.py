@@ -64,12 +64,15 @@ class FixtureBackend:
             _message("m8", "c_done", "dm", 4, ME, "收到"),
         ]
 
-    def send(self, chat, text, root):
+    def send(self, chat, text, root, mentions=()):
         self.sent.append((chat, text, root))
         return "m_sent_%d" % len(self.sent)
 
     def create_chat(self, user):
         return "c_" + user
+
+    def own_chat(self):
+        return "c_me"
 
     def search(self, query):
         return [{"type": "user", "id": "u_a", "title": "示例联系人"}]

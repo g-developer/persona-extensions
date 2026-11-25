@@ -110,27 +110,27 @@ func (s *Store) Update(f func(st *State) error) error {
 	return s.save(st)
 }
 
-// Merge adds one machine's buckets, replacing a minute of the same model and launcher that is already stored, and
-// drops days older than KeepDays before the newest day written. loc is the hub's time zone, which decides the day a
-// minute belongs to. It returns how many buckets were new or changed.
+// Merge adds one machine's buckets, replacing a minute of the same model and launcher that is already stored and
+// deleting it when its correction is zero, and drops days older than KeepDays before the newest day written. loc is
+// the hub's time zone, which decides the day a minute belongs to. It returns how many buckets were new or changed.
 func (s *Store) Merge(machine string, buckets []Bucket, loc *time.Location) (int, error) {
 	if machine == "" {
 		return 0, errors.New("a machine has no id")
 	}
 	changed := 0
 	err := s.Update(func(st *State) error {
-		byDay := map[string]*Day{}
+		byDay := map[string]int{}
 		for i := range st.Days {
 			d := &st.Days[i]
 			if d.Machine == machine {
-				byDay[d.Date] = d
+				byDay[d.Date] = i
 			}
 		}
 		index := map[string]map[key]int{}
-		for date, d := range byDay {
+		for date, i := range byDay {
 			m := map[key]int{}
-			for i, b := range d.Buckets {
-				m[keyOf(b)] = i
+			for j, b := range st.Days[i].Buckets {
+				m[keyOf(b)] = j
 			}
 			index[date] = m
 		}
@@ -139,14 +139,28 @@ func (s *Store) Merge(machine string, buckets []Bucket, loc *time.Location) (int
 				continue
 			}
 			date := time.Unix(b.Minute, 0).In(loc).Format("2006-01-02")
-			d := byDay[date]
-			if d == nil {
+			dayIndex, ok := byDay[date]
+			if !ok {
 				st.Days = append(st.Days, Day{Date: date, Machine: machine})
-				d = &st.Days[len(st.Days)-1]
-				byDay[date] = d
+				dayIndex = len(st.Days) - 1
+				byDay[date] = dayIndex
 				index[date] = map[key]int{}
 			}
+			d := &st.Days[dayIndex]
 			k := keyOf(b)
+			if b.Total() == 0 && b.Requests == 0 {
+				if i, ok := index[date][k]; ok {
+					d.Buckets = append(d.Buckets[:i], d.Buckets[i+1:]...)
+					delete(index[date], k)
+					for storedKey, j := range index[date] {
+						if j > i {
+							index[date][storedKey] = j - 1
+						}
+					}
+					changed++
+				}
+				continue
+			}
 			if i, ok := index[date][k]; ok {
 				if d.Buckets[i] != b {
 					d.Buckets[i] = b

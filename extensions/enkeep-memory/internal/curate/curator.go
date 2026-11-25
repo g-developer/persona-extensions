@@ -20,6 +20,7 @@ import (
 	"github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/kbsrc"
 	"github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/model"
 	"github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/norm"
+	"github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/profile"
 	srcs "github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/sources"
 	"github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/store"
 	"github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/voice"
@@ -43,10 +44,18 @@ type Curator struct {
 	Extension string
 	// Live is what pages read without the store's lock: the run's progress and the last snapshot (nil: none).
 	Live *Live
+	// OnPublish, when set, is called with each new snapshot's state (never to be changed) as it is published, with
+	// the store's lock held: the periodic overview's light refresh (internal/overview, L3). It must be quick.
+	OnPublish func(st *store.State)
+	// ProfileInput, when set, feeds the profile summary instead of the curated entries alone (the periodic overview's
+	// patterns first, internal/overview).
+	ProfileInput profile.InputProvider
 	// Workers > 1: the daily pass makes up to this many model calls at once (curate/prefetch.go); 0 or 1: one at a time.
 	Workers int
 	// Hub is the hub beyond the knowledge base (agents, cards, to-dos, memory, the exits' readback); nil: none.
 	Hub hubapi.Hub
+	// ledger caches the ledger's by=user quotes for ledgerFresh (relays.go); made on first use.
+	ledger *ledgerCache
 	// who caches what speaker resolution reads from the knowledge base (curate/speakers.go).
 	who *whoCache
 	// Collect is the sources' ledger (State.Sources, Cursors, ActiveDays); nil: none kept.
@@ -170,6 +179,7 @@ func (c *Curator) units(ctx context.Context, day string) ([]Unit, error) {
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Ref < out[j].Ref })
+	c.verifyRelays(ctx, out)
 	return out, nil
 }
 
