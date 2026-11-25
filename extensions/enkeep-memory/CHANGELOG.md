@@ -1,5 +1,29 @@
 # enkeep-memory changelog
 
+## 0.2.0-beta.53 (pre-release)
+
+The daily pass looks for the user's own thinking moves first, and the people-and-project skeleton is back in recall.
+
+- **Daily prompt daily/18.** Before anything else it looks for how the user checks a claim (back to the first-hand
+  source, a hunch marked as one and tested on data, an over-precise number taken as a weak sign), finds the holes (a
+  premise that breaks the conclusion, the premise of a two-option question, what a limit really prevents) and keeps
+  to the goal (stop detail that changes nothing, direction before strategy, the main contradiction first), also when
+  the lines are not about the assistant. It writes the move, not the episode; how to use one machine or path is a
+  tools observation at most. On the same raw input (19 day-batches, blind-judged, sentence only) the share of
+  thinking moves goes from 21% (daily/16) to 57–61%, level with the old pipeline's 57%. The new version reads the
+  rerun range again.
+- **Rules hang on the person or project they are for.** daily/18 puts a rule that holds for one person, project,
+  machine or chat in its scope and impact object; the impact object is now one of the subjects memory.entries
+  answers, so mentioning that person or project brings the rule in.
+- **Relation triples in three kinds.** The skeleton (assigned, depends_on, member_of, collaborates_with, with owns,
+  role and reports_to) is in the pool again: ranked by its score in recall, fed to the overview and the evaluations,
+  never standing. Only noise (about, same_circle) and passing edges (waiting_on, blocked_by, allocated, serves) not
+  seen for 14 days are weak: answered last, out of the pool.
+- **Collaboration evaluation.** Incidents are also tagged when avoiding them needs entity relations (mixing up people
+  or projects, not knowing who is responsible, missing a dependency), reported in a column of their own; two recall
+  arms answer with the standing set plus what the incident's names bring in, with and without the world and people
+  entries (the ablation).
+
 ## 0.2.0-beta.52 (pre-release)
 
 What stands in every turn is chosen by how far and how long an entry matters, not by how recent it is; the daily

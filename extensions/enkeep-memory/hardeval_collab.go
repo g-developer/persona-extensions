@@ -29,18 +29,22 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/entry"
+	"github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/memsrc"
 	"github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/model"
 	"github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/norm"
 	"github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/overview"
+	"github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/store"
 )
 
 // collabCue is what a user's correction reads like (the candidates; a model decides).
-var collabCue = regexp.MustCompile(`不是|别再|不要再|又|说过|说了|重复|第[二三四五六]遍|为什么还|怎么还|他妈|错了|搞错|我说的是|早就|不用问|别问|别来问|直接做|直接往下|直接干|废话|脱裤子`)
+var collabCue = regexp.MustCompile(`不是|别再|不要再|又|说过|说了|重复|第[二三四五六]遍|为什么还|怎么还|他妈|错了|搞错|我说的是|早就|不用问|别问|别来问|直接做|直接往下|直接干|废话|脱裤子|搞混|弄混|搞错人|认错|张冠李戴|不是他|不是她|谁负责|他负责|她负责|哪个项目|不是这个项目|不是那个`)
 
 var collabDay = regexp.MustCompile(`\b(1[0-2]|0?[1-9])-([0-3][0-9])\b`)
 
@@ -68,6 +72,11 @@ type collabIncident struct {
 	Situation string `json:"situation"`
 	Mistake   string `json:"mistake"`
 	Want      string `json:"want"`
+	// Entity: avoiding it needed who someone is, who is responsible for what, or which project or thing was meant
+	// (design l0-leverage §12): the incidents the entity relations are for, counted apart.
+	Entity bool `json:"entity,omitempty"`
+	// Recall is what the arm's recall brought in for this incident (collabRecall), shown to the answer only.
+	Recall string `json:"-"`
 }
 
 type collabSet struct {
@@ -84,13 +93,14 @@ const collabExtractPrompt = `你在从用户和 AI 助手的真实记录里整�
 
 对每条材料判断它是不是一次协作事故（incident）。是的话写出：
 - kind：corrected（纠正）、scolded（骂了）、repeated（重复交代）之一；
-- situation：事故发生前的情境，以助手的视角写：用户要什么、事情进行到哪一步、助手手上有什么。只写事实，不能透露正确做法，也不能写出助手后来做错了什么或用户的反应。80–200 字。不写真名、邮箱、账号、密钥。
+- situation：事故发生前的情境，以助手的视角写：用户要什么、事情进行到哪一步、助手手上有什么。只写事实，不能透露正确做法，也不能写出助手后来做错了什么或用户的反应。80–200 字。人名、项目名、系统名照材料原样写（评测只在本机，不进仓库），不写邮箱、账号、密钥。
 - mistake：助手当时怎么做错了，一句话。
 - want：用户真正要的是什么样的做法，一句话，写成能推广到同类情境的做法。
+- entity：要避开这次事故，是否必须知道实体关系：某人是谁、谁负责什么、谁和谁什么关系、说的是哪个项目或哪样东西（搞混人或项目、不知道谁负责、找错人）。是为 true，只靠做事习惯就能避开的为 false。
 
 不是协作事故的（只是普通追问、闲聊、用户改主意、技术报错）incident 为 false，其余字段留空。输出 JSON。`
 
-const collabExtractSchema = `{"type":"object","additionalProperties":false,"required":["items"],"properties":{"items":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["id","incident","kind","situation","mistake","want"],"properties":{"id":{"type":"string"},"incident":{"type":"boolean"},"kind":{"type":"string","enum":["","corrected","scolded","repeated"]},"situation":{"type":"string"},"mistake":{"type":"string"},"want":{"type":"string"}}}}}}`
+const collabExtractSchema = `{"type":"object","additionalProperties":false,"required":["items"],"properties":{"items":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["id","incident","kind","situation","mistake","want","entity"],"properties":{"id":{"type":"string"},"incident":{"type":"boolean"},"entity":{"type":"boolean"},"kind":{"type":"string","enum":["","corrected","scolded","repeated"]},"situation":{"type":"string"},"mistake":{"type":"string"},"want":{"type":"string"}}}}}}`
 
 const collabAnswerPrompt = `你是这位用户的主 AI 助手：能和用户对话、能派 Agent 干活、能执行命令和发授权卡。下面给你对这位用户的记忆（可能为空）和若干个互相独立的情境。对每个情境，写出你此刻实际会怎么做：如果要回复用户，先写那句回复；再写你要执行的动作。具体、简短，每个不超过 150 字。只依据记忆和情境本身。输出 JSON。`
 
@@ -305,7 +315,11 @@ func collabAnswer(ctx context.Context, answer, judge model.Model, memory string,
 			Situations []q    `json:"situations"`
 		}{Attempt: attempt, Memory: memory}
 		for _, x := range b {
-			in.Situations = append(in.Situations, q{x.ID, x.Situation})
+			s := x.Situation
+			if x.Recall != "" {
+				s += "\n\n按需召回（情境里提到的人、项目带出的记忆）：\n" + x.Recall
+			}
+			in.Situations = append(in.Situations, q{x.ID, s})
 		}
 		var out struct {
 			Answers []struct{ ID, Response string } `json:"answers"`
@@ -413,7 +427,7 @@ func collabBuild(args []string) error {
 		var o struct {
 			Items []struct {
 				ID, Kind, Situation, Mistake, Want string
-				Incident                           bool
+				Incident, Entity                   bool
 			} `json:"items"`
 		}
 		if err := collabCall(ctx, ext, collabExtractPrompt, collabExtractSchema, in, &o); err != nil {
@@ -431,7 +445,7 @@ func collabBuild(args []string) error {
 				continue
 			}
 			incs = append(incs, collabIncident{ID: c.ID, Source: c.Source, Day: c.Day, Kind: x.Kind, Situation: x.Situation,
-				Mistake: x.Mistake, Want: x.Want})
+				Mistake: x.Mistake, Want: x.Want, Entity: x.Entity})
 		}
 		return nil
 	})
@@ -499,6 +513,8 @@ type collabResult struct {
 	Bytes   map[string]map[string]int                `json:"bytes"` // budget → arm → mean bytes of the memory
 	// PerInc: budget → arm → incident → share of the repeats it was avoided in.
 	PerInc map[string]map[string]map[string]float64 `json:"per_incident"`
+	// Entity are the incidents that need entity relations (collabIncident.Entity), reported apart.
+	Entity []string `json:"entity,omitempty"`
 }
 
 func collabRun(args []string) error {
@@ -514,6 +530,7 @@ func collabRun(args []string) error {
 	arms := fs.String("arms", strings.Join(heArms, ","), "arms to answer")
 	budgets := fs.String("budgets", "1400,4096", "memory budgets in bytes")
 	repeats := fs.Int("repeats", 3, "times each arm answers (and is judged), averaged")
+	recallBytes := fs.Int("recall", 2048, "bytes of recall per incident for the recall arms (recall: the standing set and what the incident's names bring in; recall-noent: the same without the world and people entries)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -551,6 +568,12 @@ func collabRun(args []string) error {
 	judge := heCLI(*cmd, *jdg, filepath.Join(*out, "cache"))
 	res := collabResult{Model: *mdl, Judge: *jdg, Cutoff: "per incident", N: len(set.Incidents), Repeats: *repeats,
 		Score: map[string]map[string]map[string]float64{}, Bytes: map[string]map[string]int{}, PerInc: map[string]map[string]map[string]float64{}}
+	for _, inc := range set.Incidents {
+		if inc.Entity {
+			res.Entity = append(res.Entity, inc.ID)
+		}
+	}
+	names := collabNames(st)
 	samples := map[string]string{}
 	responses := map[string]map[string]string{}
 	f := heFilter{leak: map[string]bool{}, units: map[string]bool{}} // the day is the leak: an incident's own day and later are left out
@@ -566,10 +589,20 @@ func collabRun(args []string) error {
 			bytes := 0
 			for _, d := range days {
 				mems := heMemories(st, ov, collabCogFor(cogs, d), f, d, budget)
-				bytes += len(mems[arm]) * len(byDay[d])
-				samples[bk+"/"+arm+"/"+d] = mems[arm]
+				mem, incs := mems[arm], byDay[d]
+				if arm == "recall" || arm == "recall-noent" {
+					mem = mems["resident"]
+					incs = slices.Clone(incs)
+					for i := range incs {
+						incs[i].Recall = names.recall(st, f, d, incs[i].Situation, mem, *recallBytes, arm == "recall")
+						bytes += len(incs[i].Recall)
+						samples[bk+"/"+arm+"/"+incs[i].ID] = incs[i].Recall
+					}
+				}
+				bytes += len(mem) * len(incs)
+				samples[bk+"/"+arm+"/"+d] = mem
 				for r := 0; r < *repeats; r++ {
-					v, rs, err := collabAnswer(context.Background(), ans, judge, mems[arm], byDay[d], r)
+					v, rs, err := collabAnswer(context.Background(), ans, judge, mem, incs, r)
 					if err != nil {
 						return fmt.Errorf("%s/%s/%s: %w", bk, arm, d, err)
 					}
@@ -670,7 +703,7 @@ func collabTable(r collabResult, arms []string) string {
 	}
 	sort.Slice(bks, func(i, j int) bool { return len(bks[i]) < len(bks[j]) || len(bks[i]) == len(bks[j]) && bks[i] < bks[j] })
 	for _, bk := range bks {
-		fmt.Fprintf(&b, "\n### budget %s bytes\n\n| arm | bytes | avoided | needless asks | wrong actions | user repeats | vs resident (win/tie/loss for resident) |\n|---|---|---|---|---|---|---|\n", bk)
+		fmt.Fprintf(&b, "\n### budget %s bytes\n\n| arm | bytes | avoided | needless asks | wrong actions | user repeats | vs resident (win/tie/loss for resident) | entity incidents avoided (%d) |\n|---|---|---|---|---|---|---|---|\n", bk, len(r.Entity))
 		for _, arm := range arms {
 			s := r.Score[bk][arm]
 			w, t, l := 0, 0, 0
@@ -685,8 +718,16 @@ func collabTable(r collabResult, arms []string) string {
 					l++
 				}
 			}
-			fmt.Fprintf(&b, "| %s | %d | %.0f%% | %.0f%% | %.0f%% | %.0f%% | %d/%d/%d |\n", arm, r.Bytes[bk][arm], 100*s["avoided"],
-				100*s["needless_ask"], 100*s["wrong_action"], 100*s["repeat"], w, t, l)
+			ent := "-"
+			if len(r.Entity) > 0 {
+				sum := 0.0
+				for _, id := range r.Entity {
+					sum += r.PerInc[bk][arm][id]
+				}
+				ent = fmt.Sprintf("%.0f%%", 100*sum/float64(len(r.Entity)))
+			}
+			fmt.Fprintf(&b, "| %s | %d | %.0f%% | %.0f%% | %.0f%% | %.0f%% | %d/%d/%d | %s |\n", arm, r.Bytes[bk][arm], 100*s["avoided"],
+				100*s["needless_ask"], 100*s["wrong_action"], 100*s["repeat"], w, t, l, ent)
 		}
 	}
 	return b.String()
@@ -718,4 +759,66 @@ func heInputs(ovPath, cogPath string) (*overview.State, []string, error) {
 		}
 	}
 	return ov, cog, nil
+}
+
+// collabNameIndex maps the names entries can be recalled by (memsrc.Subjects: a card's person, the object, the
+// person or project a rule is for, the scopes) to the entries, for the recall arms.
+type collabNameIndex map[string][]*entry.Entry
+
+func collabNames(st *store.State) collabNameIndex {
+	idx := collabNameIndex{}
+	for _, e := range st.Entries {
+		if !memsrc.Pageable(st, e) || len(e.Cats()) > 0 || e.OriginSpace != "" || e.Inferred {
+			continue
+		}
+		for _, n := range memsrc.Subjects(st, e) {
+			if r := []rune(n); len(r) < 2 || (len(n) == len(r) && len(r) < 3) {
+				continue
+			}
+			idx[n] = append(idx[n], e)
+		}
+	}
+	return idx
+}
+
+// recall is what mentioning the incident's names brings in, as the hub's recall would: the entries whose subjects the
+// situation names, first seen before the day, not already in the standing memory, highest rank first, in budget
+// bytes. entities false leaves out the world and people entries (the ablation).
+func (idx collabNameIndex) recall(st *store.State, f heFilter, day, situation, standing string, budget int, entities bool) string {
+	seen := map[string]bool{}
+	var cands []*entry.Entry
+	for n, es := range idx {
+		if !strings.Contains(situation, n) {
+			continue
+		}
+		for _, e := range es {
+			if seen[e.ID] || f.entryOut(st, e, day) || (!entities && (e.Facet == entry.World || e.Facet == entry.People)) {
+				continue
+			}
+			seen[e.ID] = true
+			cands = append(cands, e)
+		}
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		a, b := cands[i], cands[j]
+		if ra, rb := memsrc.Rank(a), memsrc.Rank(b); ra != rb {
+			return ra > rb
+		}
+		if a.Last != b.Last {
+			return a.Last > b.Last
+		}
+		return a.ID < b.ID
+	})
+	var lines []string
+	for _, e := range cands {
+		if len(lines) > 64 {
+			break
+		}
+		t := heClip(e.Shown(), 200)
+		if strings.Contains(standing, t) {
+			continue
+		}
+		lines = append(lines, "- "+t)
+	}
+	return heFit(lines, budget)
 }

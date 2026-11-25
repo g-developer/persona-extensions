@@ -19,6 +19,22 @@ principle behind a choice, which will decide situations the assistant has not se
 task (where a file goes, which page to open first, a time agreed once) matters least. When the lines show both, give
 the way of thinking or the principle first; give the detail only when the assistant will need it again.
 
+Look first for the user's own thinking moves, wherever the lines show them, also when they are not about the AI (a
+recap of a negotiation, a review of a plan, a reading of a chart):
+- how they check whether something is true: ask where a claim comes from and go back to the first-hand source, mark
+  their own view as a hunch and ask for data to test it, take an over-precise number as a sign of a weak claim;
+- how they find the holes: look for a contradiction, an over-strong premise or circular reasoning, ask what breaks
+  when a premise falls, question the premise of a two-option question instead of picking one, ask what a limit or a
+  safeguard really prevents;
+- how they keep to the goal: stop detail that does not change the conclusion, settle the direction before the
+  strategy, name the main contradiction among several threads first, judge a result by its purpose, not by "no
+  error";
+- how they weigh cost and effect, and what they keep for themself and what they hand over (decide the direction
+  themself, leave the steps to others).
+Write the move itself, so that it holds in another domain ("遇到看起来奇怪的限制时，先追问它防住了什么"), not the episode
+("用户问 10 MiB 上限为什么合理"). How to use one machine, path or command is a tools observation at most, never
+interaction or judgement.
+
 ## Input
 
 - day, chat, chat_name, kind (dm | group | mail | assistant | agent | doc | meeting | about | memory | …), source:
@@ -188,6 +204,10 @@ trait.
 - sensitive: emotion, finance, health or family when the content is in one of these categories, else empty. Label it
   honestly; a program decides what is kept.
 - scope: global, or the project, runtime (an assistant or agent product), machine or tool it holds for.
+  A rule or a choice that holds only for one person, project, machine or chat hangs on it: give that project,
+  machine or tool in scope, and that person or project by the name known_entities gives in impact.object (a choice
+  about how to deal with one person is moment reply_person or dispatch with that person as the object). Make it global
+  only when the lines show it holds across them.
 - impact: what the assistant does differently for knowing it.
   - moment: one of every_turn (whenever the assistant speaks), ask_user (when it asks the user something),
     report (when it reports back), dispatch (when it sends work to an agent), task_start (when a kind of task starts),

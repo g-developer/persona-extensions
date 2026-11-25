@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/curate"
@@ -130,21 +131,33 @@ func before(a, b key) bool {
 	return a.I < b.I
 }
 
-// weakPredicates are low-value relation triples (e.g. "A depends on B", "A works with B") that crowd memory.entries
-// without actionable guidance. They stay in state and are only filtered at the memory.entries outlet unless the user
-// explicitly pinned, edited or confirmed them.
-var weakPredicates = map[string]bool{
-	"about":             true,
-	"allocated":         true,
-	"assigned":          true,
-	"blocked_by":        true,
-	"collaborates_with": true,
-	"depends_on":        true,
-	"member_of":         true,
-	"same_circle":       true,
-	"serves":            true,
-	"waiting_on":        true,
+// Relation predicates, in three kinds (0.2.0-beta.53, design l0-leverage §13; the collaboration gap analysis §4.4):
+//   - the skeleton (assigned, depends_on, member_of, collaborates_with, with owns, role and reports_to): who is
+//     responsible for what, which team, what depends on what, who works with whom. Never standing (a world entry has
+//     no standing kind), but ranked by its score in recall and fed to the overview and the evaluations like any entry;
+//   - noise (about, same_circle): "X is about Y", a shared circle; ranked last, kept out of Pool;
+//   - passing edges (waiting_on, blocked_by, allocated, serves): what holds now; weak only once stale, when last seen
+//     more than staleDays ago.
+//
+// Up to beta.52 all ten were weak alike. Nothing is deleted from state; user-pinned, user-edited or user-confirmed
+// entries are never weak.
+var noisePredicates = map[string]bool{
+	"about":       true,
+	"same_circle": true,
 }
+
+var passingPredicates = map[string]bool{
+	"allocated":  true,
+	"blocked_by": true,
+	"serves":     true,
+	"waiting_on": true,
+}
+
+// staleDays is how long a passing edge stays strong after it was last seen.
+const staleDays = 14
+
+// nowFn is the clock IsWeakRelation reads a passing edge's age by (tests set it).
+var nowFn = time.Now
 
 // substantiveWorldTypes are world-facet types that carry durable project/ownership/decision value over transient status.
 var substantiveWorldTypes = map[string]bool{
@@ -169,13 +182,22 @@ func userConfirmedRight(e *entry.Entry) bool {
 	return false
 }
 
-// IsWeakRelation says whether e is a low-value relation triple excluded from memory.entries. Nothing is deleted from
-// state; user-pinned, user-edited or user-confirmed entries are always kept.
+// IsWeakRelation says whether e is a low-value relation triple: a noise edge, or a passing edge not seen for
+// staleDays (see noisePredicates). Weak triples are answered by memory.entries ranked last and kept out of Pool. The
+// skeleton edges are never weak.
 func IsWeakRelation(e *entry.Entry) bool {
 	if e == nil || e.Facet != entry.World || e.Predicate == "" {
 		return false
 	}
-	if !weakPredicates[strings.ToLower(strings.TrimSpace(e.Predicate))] {
+	p := strings.ToLower(strings.TrimSpace(e.Predicate))
+	switch {
+	case noisePredicates[p]:
+	case passingPredicates[p]:
+		last, err := time.Parse("2006-01-02", e.Last)
+		if err == nil && nowFn().Sub(last) <= staleDays*24*time.Hour {
+			return false
+		}
+	default:
 		return false
 	}
 	if e.Pinned || (e.User != nil && strings.TrimSpace(e.User.Text) != "") || userConfirmedRight(e) {
@@ -375,7 +397,8 @@ func backfill(st *store.State, e *entry.Entry, depth int) ([]string, string) {
 	return cats, space
 }
 
-// Subjects are the names whose mention brings the entry in: the person of a card, its object, its scopes' names.
+// Subjects are the names whose mention brings the entry in: the person of a card, its object, the person or project
+// its impact is for, its scopes' names.
 func Subjects(st *store.State, e *entry.Entry) []string {
 	var out []string
 	add := func(s string) {
@@ -389,6 +412,11 @@ func Subjects(st *store.State, e *entry.Entry) []string {
 		add(k.Name)
 	}
 	add(e.Object)
+	// The person or project a rule is for (impact.object, design l0-leverage §13: rules hang on entities): mentioning
+	// them brings the rule in. A kind of task named there is a short phrase too and does no harm.
+	if o := strings.TrimSpace(e.Impact.Object); utf8.RuneCountInString(o) <= 24 {
+		add(o)
+	}
 	for _, sc := range e.Scopes {
 		if sc.Kind != entry.ScopeGlobal {
 			add(sc.Name)

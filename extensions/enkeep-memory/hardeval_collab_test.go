@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/entry"
+	"github.com/nwverse/persona-extensions/extensions/enkeep-memory/internal/store"
 )
 
 // Synthetic fixtures only.
@@ -46,5 +49,39 @@ func TestCollabSessionCands(t *testing.T) {
 	c := cs[0].Text
 	if !strings.Contains(c, "clean up the disk") || !strings.Contains(c, "[AskUser") || !strings.Contains(c, "我说过了，直接做") {
 		t.Errorf("context %q", c)
+	}
+}
+
+func TestCollabTableEntity(t *testing.T) {
+	r := collabResult{Model: "m", Judge: "j", N: 2, Repeats: 1, Entity: []string{"a"},
+		Score:  map[string]map[string]map[string]float64{"1400": {"resident": {"avoided": 0.5}}},
+		Bytes:  map[string]map[string]int{"1400": {"resident": 1400}},
+		PerInc: map[string]map[string]map[string]float64{"1400": {"resident": {"a": 1, "b": 0}}}}
+	md := collabTable(r, []string{"resident"})
+	if !strings.Contains(md, "entity incidents avoided (1)") || !strings.Contains(md, "| 0/2/0 | 100% |") {
+		t.Fatalf("entity column missing:\n%s", md)
+	}
+	if !collabCue.MatchString("你又搞混人了，这个不是他负责的") {
+		t.Fatal("entity cue not matched")
+	}
+}
+
+// The recall arms bring in what the incident's names point at, before the day; the ablation leaves out the world and
+// people entries.
+func TestCollabRecall(t *testing.T) {
+	st := &store.State{Entries: map[string]*entry.Entry{
+		"w-own":  {ID: "w-own", Facet: entry.World, Predicate: "owns", Object: "project-x", Text: "user-b is responsible for project-x", Status: entry.Stable, Count: 3, First: "2026-11-01", Last: "2026-11-10", Tagged: true, Origin: entry.Behavior},
+		"j-rule": {ID: "j-rule", Facet: entry.Judgement, Text: "for project-x, release only after the gate", Status: entry.Stable, Count: 3, First: "2026-11-01", Last: "2026-11-10", Tagged: true, Origin: entry.Behavior, Scopes: []entry.Scope{{Kind: entry.ScopeProject, Name: "project-x"}}},
+		"j-late": {ID: "j-late", Facet: entry.Judgement, Text: "for project-x, a rule learnt later", Status: entry.Stable, Count: 3, First: "2026-11-20", Last: "2026-11-20", Tagged: true, Origin: entry.Behavior, Scopes: []entry.Scope{{Kind: entry.ScopeProject, Name: "project-x"}}},
+	}}
+	f := heFilter{leak: map[string]bool{}, units: map[string]bool{}}
+	idx := collabNames(st)
+	all := idx.recall(st, f, "2026-11-16", "the user asks who should review project-x", "", 2048, true)
+	if !strings.Contains(all, "user-b is responsible") || !strings.Contains(all, "release only after the gate") || strings.Contains(all, "learnt later") {
+		t.Fatalf("recall = %q", all)
+	}
+	noent := idx.recall(st, f, "2026-11-16", "the user asks who should review project-x", "", 2048, false)
+	if strings.Contains(noent, "user-b is responsible") || !strings.Contains(noent, "release only after the gate") {
+		t.Fatalf("ablation = %q", noent)
 	}
 }

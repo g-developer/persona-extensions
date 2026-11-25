@@ -13,7 +13,7 @@ import (
 // the same chat-day is digested again only when the prompt actually changed (and raw answers stay comparable).
 const (
 	TriagePrompt = "triage/2"
-	DailyPrompt  = "daily/17"
+	DailyPrompt  = "daily/18"
 	WeeklyPrompt = "weekly/2"
 	MemoryPrompt = "memory/2"
 	SynthPrompt  = "synth/1"
@@ -152,7 +152,7 @@ type Observation struct {
 	Sensitive  string         `json:"sensitive,omitempty"` // emotion | finance | health | family, or ""
 	Scope      string         `json:"scope,omitempty"`     // global, or the project, runtime, machine or tool
 	Durable    bool           `json:"durable,omitempty"`   // the user said it holds from now on ("always", "remember this")
-	// daily/17: how far it reaches and how long it holds, the principle behind it, and for a way of thinking its
+	// daily/17 (and on): how far it reaches and how long it holds, the principle behind it, and for a way of thinking its
 	// dimension and a few words naming the behaviour (entry.Leverage).
 	Reach             string     `json:"reach,omitempty"`
 	Horizon           string     `json:"horizon,omitempty"`

@@ -173,21 +173,25 @@ func TestPageSize(t *testing.T) {
 	}
 }
 
-// Low-value weak relation triples (depends_on, collaborates_with, about, member_of, same_circle, waiting_on, ...)
-// are answered last (0.2.0-beta.52: the hub reads every page, so they no longer crowd out the rest; the record is kept
-// for recall), never standing, and stay out of the pool the overview and the exits read. Pinned, edited or
+// Relation triples come in three kinds (0.2.0-beta.53): the skeleton (depends_on, collaborates_with, member_of,
+// assigned) is in the pool and ranked by its score like any entry, never standing; noise (about, same_circle) and
+// passing edges not seen for staleDays are weak: answered last, never standing, out of the pool. Pinned, edited or
 // confirmed ones count as any other.
 func TestWeakRelationsFiltered(t *testing.T) {
+	defer func(f func() time.Time) { nowFn = f }(nowFn)
+	nowFn = func() time.Time { return time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC) }
 	st := &store.State{Entries: map[string]*entry.Entry{
 		"rel-dep":     {ID: "rel-dep", Facet: entry.World, Predicate: "depends_on", Text: "service-a depends on service-b", Status: entry.Stable, Count: 5, Last: "2026-11-10", Tagged: true, Origin: entry.Behavior},
 		"rel-collab":  {ID: "rel-collab", Facet: entry.World, Predicate: "collaborates_with", Text: "user-a works with user-b", Status: entry.Stable, Count: 8, Last: "2026-11-10", Tagged: true, Origin: entry.Behavior},
 		"rel-about":   {ID: "rel-about", Facet: entry.World, Predicate: "about", Text: "doc-a is about project-x", Status: entry.Stable, Count: 3, Last: "2026-11-10", Tagged: true, Origin: entry.Behavior},
 		"rel-member":  {ID: "rel-member", Facet: entry.World, Predicate: "member_of", Text: "user-b belongs to team-a", Status: entry.Stable, Count: 3, Last: "2026-11-10", Tagged: true, Origin: entry.Behavior},
-		"rel-pinned":  {ID: "rel-pinned", Facet: entry.World, Predicate: "depends_on", Text: "core-a depends on core-b", Status: entry.Stable, Pinned: true, Count: 1, Last: "2026-11-10", Tagged: true, Origin: entry.Behavior},
-		"rel-edited":  {ID: "rel-edited", Facet: entry.World, Predicate: "collaborates_with", Text: "raw", User: &entry.UserEdit{Text: "key partner"}, Status: entry.Stable, Count: 1, Last: "2026-11-10", Tagged: true, Origin: entry.Behavior},
-		"rel-confirm": {ID: "rel-confirm", Facet: entry.World, Predicate: "depends_on", Text: "confirmed dep", Verdicts: []entry.Verdict{{Mark: "right", By: "user"}}, Status: entry.Stable, Count: 1, Last: "2026-11-10", Tagged: true, Origin: entry.Behavior},
+		"rel-circle":  {ID: "rel-circle", Facet: entry.World, Predicate: "same_circle", Text: "user-c and user-d share a group", Status: entry.Stable, Count: 3, Last: "2026-11-10", Tagged: true, Origin: entry.Behavior},
+		"rel-wait":    {ID: "rel-wait", Facet: entry.World, Predicate: "waiting_on", Text: "task-a waits on user-b", Status: entry.Stable, Count: 2, Last: "2026-11-18", Tagged: true, Origin: entry.Behavior},
+		"rel-stale":   {ID: "rel-stale", Facet: entry.World, Predicate: "blocked_by", Text: "task-b blocked by review-c", Status: entry.Stable, Count: 2, Last: "2026-10-01", Tagged: true, Origin: entry.Behavior},
+		"rel-pinned":  {ID: "rel-pinned", Facet: entry.World, Predicate: "about", Text: "core-a is about core-b", Status: entry.Stable, Pinned: true, Count: 1, Last: "2026-11-10", Tagged: true, Origin: entry.Behavior},
+		"rel-edited":  {ID: "rel-edited", Facet: entry.World, Predicate: "same_circle", Text: "raw", User: &entry.UserEdit{Text: "key partner"}, Status: entry.Stable, Count: 1, Last: "2026-11-10", Tagged: true, Origin: entry.Behavior},
+		"rel-confirm": {ID: "rel-confirm", Facet: entry.World, Predicate: "about", Text: "confirmed topic", Verdicts: []entry.Verdict{{Mark: "right", By: "user"}}, Status: entry.Stable, Count: 1, Last: "2026-11-10", Tagged: true, Origin: entry.Behavior},
 		"rel-owns":    {ID: "rel-owns", Facet: entry.World, Predicate: "owns", Text: "user-b is responsible for project-x", Status: entry.Stable, Count: 2, Last: "2026-11-10", Tagged: true, Origin: entry.Behavior},
-		"rel-means":   {ID: "rel-means", Facet: entry.World, Predicate: "means", Text: "abbr-x means service-x", Status: entry.Stable, Count: 2, Last: "2026-11-10", Tagged: true, Origin: entry.Behavior},
 	}}
 	r, n, err := Page(st, Params{Contribution: "memory", Limit: 200})
 	if err != nil {
@@ -195,13 +199,13 @@ func TestWeakRelationsFiltered(t *testing.T) {
 	}
 	got := ids(r)
 	first := len(got)
-	for _, weak := range []string{"rel-dep", "rel-collab", "rel-about", "rel-member"} {
+	for _, weak := range []string{"rel-about", "rel-circle", "rel-stale"} {
 		i := slices.Index(got, weak)
 		if i < 0 {
 			t.Errorf("weak relation %s not answered: %v", weak, got)
 		}
 		first = min(first, i)
-		if Pool(st, st.Entries[weak]) {
+		if !IsWeakRelation(st.Entries[weak]) || Pool(st, st.Entries[weak]) {
 			t.Errorf("weak relation %s in the pool", weak)
 		}
 	}
@@ -210,13 +214,22 @@ func TestWeakRelationsFiltered(t *testing.T) {
 			t.Errorf("weak relations are answered last, not standing: %v", got)
 		}
 	}
-	for _, keep := range []string{"rel-pinned", "rel-edited", "rel-confirm", "rel-owns", "rel-means"} {
-		if !slices.Contains(got, keep) {
-			t.Errorf("expected %s to stay in memory.entries: %v", keep, got)
+	for _, keep := range []string{"rel-dep", "rel-collab", "rel-member", "rel-wait", "rel-pinned", "rel-edited", "rel-confirm", "rel-owns"} {
+		i := slices.Index(got, keep)
+		if i < 0 || i > first || IsWeakRelation(st.Entries[keep]) || !Pool(st, st.Entries[keep]) {
+			t.Errorf("%s should be in the pool and ranked by its score: %v", keep, got)
+		}
+		if Rank(st.Entries[keep]) <= 9 && !st.Entries[keep].Pinned {
+			t.Errorf("%s pressed to rank %d", keep, Rank(st.Entries[keep]))
 		}
 	}
-	if n.Entries != 9 {
-		t.Errorf("answered = %d, want 9", n.Entries)
+	for _, e := range r.Entries {
+		if e.Standing {
+			t.Errorf("a relation stands: %s", e.ID)
+		}
+	}
+	if n.Entries != 11 {
+		t.Errorf("answered = %d, want 11", n.Entries)
 	}
 }
 
@@ -331,5 +344,17 @@ func TestPageWithExtras(t *testing.T) {
 	res2, _, err := PageWith(st, nil, extras, Params{Contribution: "memory", Limit: 1, After: res.After})
 	if err != nil || len(res2.Entries) != 1 || res2.Entries[0].ID != "ov:cat:health:bb" {
 		t.Fatalf("%v %+v", err, res2)
+	}
+}
+
+// A rule hangs on the person or project it is for: its impact object and project scope are subjects (design
+// l0-leverage §13), so mentioning them brings it in.
+func TestSubjectsHangRules(t *testing.T) {
+	st := &store.State{}
+	e := &entry.Entry{ID: "j-1", Facet: entry.Judgement, Text: "with user-b, settle by a call, not by text",
+		Impact: entry.Impact{Moment: "reply_person", Action: "proposes a call", Object: "user-b"},
+		Scopes: []entry.Scope{{Kind: entry.ScopeProject, Name: "project-x"}, {Kind: entry.ScopeGlobal}}}
+	if got := Subjects(st, e); !slices.Equal(got, []string{"user-b", "project-x"}) {
+		t.Fatalf("subjects = %v", got)
 	}
 }

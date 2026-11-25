@@ -69,6 +69,11 @@ Since beta.52 the extension picks the standing set itself, by leverage, to fit:
 - **Everything else is recalled on demand,** never standing, ranked by score (×9, at most 891; a weak relation last),
   and carries one line of the user's own words behind it (`原话：「…」（day）`, at most 80 characters) so a recall
   brings the source, not only the summary. Entries tagged with a category or said in a space never stand.
+- **Entities (beta.53).** The relation skeleton (assigned, depends_on, member_of, collaborates_with, owns, role,
+  reports_to) is recalled by its score like any entry and feeds the overview, but never stands; only `about`,
+  `same_circle` and passing edges (waiting_on, blocked_by, allocated, serves) unseen for 14 days are weak and ranked
+  last. A rule hangs on the person or project it is for: its scopes, object and impact object are its subjects, so
+  naming them brings it in.
 - **Patterns and the profile.** Overview patterns compete for the same set with their own score (lifecycle, scenes,
   sources, weeks; at most 70, on the entries' scale); `ov:cat:` patterns and the profile summaries (`profile:*`) are recalled, not standing.
 
