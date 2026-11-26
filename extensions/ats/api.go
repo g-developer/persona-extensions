@@ -197,17 +197,20 @@ type attemptView struct {
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 	ExitCode   *int       `json:"exit_code,omitempty"`
-	Dirty      bool       `json:"dirty,omitempty"`
+	Dirty      *bool      `json:"dirty,omitempty"`
 	ErrorClass string     `json:"error_class,omitempty"`
 	Verdict    string     `json:"verdict,omitempty"`
 	Summary    string     `json:"summary,omitempty"`
+
+	TodoAttachError string `json:"todo_attach_error,omitempty"`
 }
 
 func viewAttempts(atts []Attempt) []attemptView {
 	out := make([]attemptView, 0, len(atts))
 	for _, a := range atts {
 		out = append(out, attemptView{AttemptNo: a.AttemptNo, State: a.State, Machine: a.Machine, ModelTier: a.ModelTier,
-			StartedAt: a.StartedAt, FinishedAt: a.FinishedAt, ExitCode: a.ExitCode, Dirty: a.Dirty, ErrorClass: a.ErrorClass, Verdict: a.Verdict, Summary: a.Summary})
+			StartedAt: a.StartedAt, FinishedAt: a.FinishedAt, ExitCode: a.ExitCode, Dirty: a.Dirty, ErrorClass: a.ErrorClass,
+			Verdict: a.Verdict, Summary: a.Summary, TodoAttachError: a.TodoAttachError})
 	}
 	return out
 }
@@ -375,18 +378,20 @@ type reportView struct {
 	Verdict    string     `json:"verdict,omitempty"`
 	ErrorClass string     `json:"error_class,omitempty"`
 	ExitCode   *int       `json:"exit_code,omitempty"`
-	Dirty      bool       `json:"dirty,omitempty"`
+	Dirty      *bool      `json:"dirty,omitempty"`
 	Summary    string     `json:"summary,omitempty"`
 	Artifacts  []Artifact `json:"artifacts,omitempty"`
 	Message    string     `json:"message,omitempty"`
 	// MessageBytes is the length of the whole message, set when Message is cut or left out.
 	MessageBytes int       `json:"message_bytes,omitempty"`
 	ReceivedAt   time.Time `json:"received_at"`
+
+	TodoAttachError string `json:"todo_attach_error,omitempty"`
 }
 
 func viewReport(r EvidenceReport) *reportView {
 	v := &reportView{AttemptNo: r.AttemptNo, Outcome: r.Outcome, Verdict: r.Verdict, ErrorClass: r.ErrorClass, ExitCode: r.ExitCode,
-		Dirty: r.Dirty, Summary: r.Summary, Artifacts: r.Artifacts, ReceivedAt: r.ReceivedAt}
+		Dirty: r.Dirty, Summary: r.Summary, Artifacts: r.Artifacts, ReceivedAt: r.ReceivedAt, TodoAttachError: r.TodoAttachError}
 	// With no acceptance command the message of a success is the agent's whole reply, which the summary is taken from.
 	if !(r.Outcome == StateSucceeded && r.ExitCode == nil && strings.TrimSpace(r.Summary) != "") {
 		v.Message = outputEnd(r.Message, evidenceTailRunes)

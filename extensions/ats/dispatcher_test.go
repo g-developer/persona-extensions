@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -136,11 +137,46 @@ func TestReadonlyWithoutAcceptanceStillReportsAndKeepsSourceChanges(t *testing.T
 			r.tick()
 			r.tick()
 			got := r.task(task.ID)
-			if len(got.Reports) != 1 || !got.Reports[0].Dirty || !slices.Contains(artifactKinds(got), "worktree") {
+			if len(got.Reports) != 1 || got.Reports[0].Dirty == nil || !*got.Reports[0].Dirty || !slices.Contains(artifactKinds(got), "worktree") {
 				t.Fatalf("missing dirty worktree evidence: %+v", got.Reports)
 			}
 			if _, err := os.Stat(filepath.Join(wt, name)); err != nil {
 				t.Fatalf("worktree did not retain the work: %v", err)
+			}
+		})
+	}
+}
+
+func TestDispatcherPreservesInspectionWhenReleaseFails(t *testing.T) {
+	for _, tc := range []struct {
+		name, acceptance string
+		wantDirty        *bool
+	}{
+		{"clean acceptance", "true", boolPtr(false)},
+		{"dirty acceptance", "echo work > draft.txt", boolPtr(true)},
+		{"no acceptance", "", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			r.nodes.fail["ats.release"] = errors.New("node unavailable")
+			task := r.enqueue(EnqueueInput{PermissionProfile: PermissionDefault, AcceptanceCommand: tc.acceptance})
+			r.tick()
+			r.hub.turnEnds("session-1", "u1", "Finished.")
+			r.tick()
+			r.tick()
+			if tc.acceptance != "" {
+				r.waitAccepted(task.ID, 1)
+				r.tick()
+			}
+			got := r.task(task.ID)
+			if got.State != StateSucceeded || len(got.Attempts) != 1 || len(got.Reports) != 1 {
+				t.Fatalf("task did not finish: state %s, attempts %d, reports %d", got.State, len(got.Attempts), len(got.Reports))
+			}
+			if !slices.Contains(artifactKinds(got), "worktree") {
+				t.Fatal("release failure did not retain the worktree artifact")
+			}
+			if !reflect.DeepEqual(got.Attempts[0].Dirty, tc.wantDirty) || !reflect.DeepEqual(got.Reports[0].Dirty, tc.wantDirty) {
+				t.Fatalf("dirty evidence did not reflect the acceptance result for %q", tc.name)
 			}
 		})
 	}
@@ -327,6 +363,10 @@ func TestWritingTaskRecordsReleasedHead(t *testing.T) {
 			report := got.Reports[0]
 			if got.Attempts[0].HeadSHA != head || report.HeadSHA != head {
 				t.Errorf("persisted head_sha = %q in attempt and %q in report, want %s", got.Attempts[0].HeadSHA, report.HeadSHA, head)
+			}
+			wantDirty := tc.pendingEdits && tc.acceptance != ""
+			if !reflect.DeepEqual(got.Attempts[0].Dirty, &wantDirty) || !reflect.DeepEqual(report.Dirty, &wantDirty) {
+				t.Errorf("attempt and report should both have dirty = %t", wantDirty)
 			}
 			var commits []string
 			for _, a := range report.Artifacts {

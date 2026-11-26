@@ -154,7 +154,7 @@ type Attempt struct {
 	Worktree       string     `json:"worktree,omitempty"`
 	BaseSHA        string     `json:"base_sha,omitempty"`
 	HeadSHA        string     `json:"head_sha,omitempty"`
-	Dirty          bool       `json:"dirty,omitempty"`
+	Dirty          *bool      `json:"dirty,omitempty"` // nil 表示未取得工作树检查结果
 	FullReply      string     `json:"full_reply,omitempty"`
 	Harness        string     `json:"harness,omitempty"`
 	State          string     `json:"state"`
@@ -189,7 +189,7 @@ type EvidenceReport struct {
 	Worktree   string    `json:"worktree,omitempty"`
 	BaseSHA    string    `json:"base_sha,omitempty"`
 	HeadSHA    string    `json:"head_sha,omitempty"`
-	Dirty      bool      `json:"dirty,omitempty"`
+	Dirty      *bool     `json:"dirty,omitempty"`
 	FullReply  string    `json:"full_reply,omitempty"`
 	// Summary is the end of the agent's last reply in this attempt: what it says it did and found.
 	Summary   string     `json:"summary,omitempty"`
@@ -263,7 +263,7 @@ type Execution struct {
 	Launcher   string    `json:"launcher,omitempty"`
 	Model      string    `json:"model,omitempty"`
 	HeadSHA    string    `json:"head_sha,omitempty"`
-	Dirty      bool      `json:"dirty,omitempty"`
+	Dirty      *bool     `json:"dirty,omitempty"`
 	FullReply  string    `json:"full_reply,omitempty"`
 	// SeenUpdate is the session's updated_at at the last poll that found its turn over, and Stable how many
 	// polls in a row found it so: the hub reports a finished turn for a moment between an agent's steps.
@@ -623,7 +623,7 @@ type CompleteAttemptInput struct {
 	Worktree   string `json:"worktree,omitempty"`
 	BaseSHA    string `json:"base_sha,omitempty"`
 	HeadSHA    string `json:"head_sha,omitempty"`
-	Dirty      bool   `json:"dirty,omitempty"`
+	Dirty      *bool  `json:"dirty,omitempty"`
 	FullReply  string `json:"full_reply,omitempty"`
 	Artifacts  []Artifact
 	Retryable  *bool
@@ -832,6 +832,15 @@ func (q *Queue) saveLocked() error {
 	return os.Rename(tmp, q.dataFile)
 }
 
+func boolPtr(v bool) *bool { return &v }
+
+func cloneBoolPtr(p *bool) *bool {
+	if p == nil {
+		return nil
+	}
+	return boolPtr(*p)
+}
+
 func cloneTask(t *Task) *Task {
 	if t == nil {
 		return nil
@@ -861,6 +870,7 @@ func cloneTask(t *Task) *Task {
 	}
 	if t.Exec != nil {
 		e := *t.Exec
+		e.Dirty = cloneBoolPtr(e.Dirty)
 		out.Exec = &e
 	}
 	if t.Attempts != nil {
@@ -879,6 +889,7 @@ func cloneTask(t *Task) *Task {
 				ec := *a.ExitCode
 				att.ExitCode = &ec
 			}
+			att.Dirty = cloneBoolPtr(a.Dirty)
 			out.Attempts[i] = att
 		}
 	}
@@ -890,6 +901,7 @@ func cloneTask(t *Task) *Task {
 				ec := *r.ExitCode
 				rep.ExitCode = &ec
 			}
+			rep.Dirty = cloneBoolPtr(r.Dirty)
 			if r.Artifacts != nil {
 				rep.Artifacts = slices.Clone(r.Artifacts)
 			}
@@ -1218,7 +1230,7 @@ func (q *Queue) CompleteAttempt(in CompleteAttemptInput) (*Task, error) {
 		Worktree:   in.Worktree,
 		BaseSHA:    in.BaseSHA,
 		HeadSHA:    in.HeadSHA,
-		Dirty:      in.Dirty,
+		Dirty:      cloneBoolPtr(in.Dirty),
 		FullReply:  in.FullReply,
 		Artifacts:  slices.Clone(in.Artifacts),
 
@@ -1232,7 +1244,8 @@ func (q *Queue) CompleteAttempt(in CompleteAttemptInput) (*Task, error) {
 	att.ErrorClass = in.ErrorClass
 	att.Verdict = verdict
 	att.Launcher, att.Model, att.SessionID, att.Worktree = in.Launcher, in.Model, in.SessionID, in.Worktree
-	att.BaseSHA, att.HeadSHA, att.Dirty, att.FullReply = in.BaseSHA, in.HeadSHA, in.Dirty, in.FullReply
+	att.BaseSHA, att.HeadSHA, att.FullReply = in.BaseSHA, in.HeadSHA, in.FullReply
+	att.Dirty = cloneBoolPtr(in.Dirty)
 	att.Summary = firstLinePreview(in.Message, 200)
 	t.Summary = att.Summary
 

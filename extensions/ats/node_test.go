@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -239,7 +240,7 @@ func TestAcceptRunsTheCommandInTheWorktreeWithoutTheHubsEnvironment(t *testing.T
 		t.Fatal(err)
 	}
 	got := waitResult(t, done)
-	if !got.Done || got.ExitCode != 7 || got.TimedOut || !got.Dirty || got.HeadSHA != res.BaseSHA {
+	if !got.Done || got.ExitCode != 7 || got.TimedOut || got.Dirty == nil || !*got.Dirty || got.HeadSHA != res.BaseSHA {
 		t.Fatalf("result: %+v", got)
 	}
 	if !strings.Contains(got.OutputTail, "token=[]") || !strings.Contains(got.OutputTail, res.Path) {
@@ -247,13 +248,45 @@ func TestAcceptRunsTheCommandInTheWorktreeWithoutTheHubsEnvironment(t *testing.T
 	}
 	// The result is kept for a hub program that missed the event.
 	status, err := w.acceptStatus("task_a", 1)
-	if err != nil || status != got {
+	if err != nil || !reflect.DeepEqual(status, got) {
 		t.Fatalf("status: %+v %v", status, err)
 	}
 	// An attempt this program knows nothing of: its command did not survive.
 	lost, err := w.acceptStatus("task_zz", 1)
 	if err != nil || !lost.Done || lost.ExitCode != -1 || !strings.Contains(lost.Error, "lost") {
 		t.Fatalf("status of an unknown attempt: %+v %v", lost, err)
+	}
+}
+
+func TestAcceptReportsDirtyOnlyAfterInspection(t *testing.T) {
+	clean := false
+	for _, tc := range []struct {
+		name, command string
+		wantDirty     *bool
+	}{
+		{"clean", "true", &clean},
+		{"inspection fails", "mv .git .git-moved", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, repo := newTestRepo(t)
+			w, done := newTestWorker(t, root)
+			if _, err := w.prepare(t.Context(), prepareParams{TaskID: "task_a", Attempt: 1, Repo: repo, Readonly: true}); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.accept(acceptParams{TaskID: "task_a", Attempt: 1, Command: tc.command}); err != nil {
+				t.Fatal(err)
+			}
+			got := waitResult(t, done)
+			wantError := tc.wantDirty == nil
+			if !got.Done || got.ExitCode != 0 || (got.Error != "") != wantError || (wantError && !strings.Contains(got.Error, "check worktree:")) {
+				t.Fatalf("acceptance result: %+v", got)
+			}
+			raw, err := os.ReadFile(w.resultFile("task_a-1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertDirtyJSON(t, raw, tc.wantDirty)
+		})
 	}
 }
 
@@ -299,7 +332,7 @@ func TestReleaseKeepsWorkAndDropsWhatIsEmpty(t *testing.T) {
 	// Nothing done: the worktree and the branch go.
 	a := prep("task_a")
 	res, err := w.release(ctx, releaseParams{TaskID: "task_a", Attempt: 1, Repo: repo, BaseSHA: a.BaseSHA})
-	if err != nil || !res.Removed || res.Branch != "" || branches() != "" {
+	if err != nil || !res.Removed || res.Branch != "" || res.Dirty == nil || *res.Dirty || branches() != "" {
 		t.Fatalf("release of an untouched attempt: %+v %v, branches %q", res, err, branches())
 	}
 
@@ -312,7 +345,7 @@ func TestReleaseKeepsWorkAndDropsWhatIsEmpty(t *testing.T) {
 	runGit(t, b.Path, "commit", "-q", "-m", "work")
 	head := runGit(t, b.Path, "rev-parse", "HEAD")
 	res, err = w.release(ctx, releaseParams{TaskID: "task_b", Attempt: 1, Repo: repo, BaseSHA: b.BaseSHA})
-	if err != nil || !res.Removed || res.Branch != "ats/task_b-1" || res.HeadSHA != head || branches() != "ats/task_b-1" {
+	if err != nil || !res.Removed || res.Branch != "ats/task_b-1" || res.HeadSHA != head || res.Dirty == nil || *res.Dirty || branches() != "ats/task_b-1" {
 		t.Fatalf("release of an attempt with a commit: %+v %v, branches %q", res, err, branches())
 	}
 	if _, err := os.Stat(b.Path); !errors.Is(err, os.ErrNotExist) {
@@ -325,7 +358,7 @@ func TestReleaseKeepsWorkAndDropsWhatIsEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	res, err = w.release(ctx, releaseParams{TaskID: "task_c", Attempt: 1, Repo: repo, BaseSHA: c.BaseSHA})
-	if err != nil || res.Removed || res.Kept != c.Path {
+	if err != nil || res.Removed || res.Kept != c.Path || res.Dirty == nil || !*res.Dirty {
 		t.Fatalf("release of a dirty worktree: %+v %v", res, err)
 	}
 	if _, err := os.Stat(filepath.Join(c.Path, "draft.txt")); err != nil {
@@ -333,9 +366,31 @@ func TestReleaseKeepsWorkAndDropsWhatIsEmpty(t *testing.T) {
 	}
 
 	// Released twice, or never prepared: nothing to do.
-	if res, err := w.release(ctx, releaseParams{TaskID: "task_a", Attempt: 1, Repo: repo}); err != nil || !res.Removed {
+	if res, err := w.release(ctx, releaseParams{TaskID: "task_a", Attempt: 1, Repo: repo}); err != nil || !res.Removed || res.Dirty != nil {
 		t.Fatalf("second release: %+v %v", res, err)
 	}
+}
+
+func TestReleaseReportsCleanAfterAutoCommit(t *testing.T) {
+	root, repo := newTestRepo(t)
+	w, _ := newTestWorker(t, root)
+	p, err := w.prepare(t.Context(), prepareParams{TaskID: "task_a", Attempt: 1, Repo: repo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(p.Path, "draft.txt"), []byte("draft\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := w.release(t.Context(), releaseParams{TaskID: "task_a", Attempt: 1, Repo: repo, BaseSHA: p.BaseSHA, CommitMessage: "Keep work"})
+	if err != nil || !res.Removed || res.Branch != p.Branch || res.HeadSHA == "" || res.HeadSHA == p.BaseSHA {
+		t.Fatalf("release after auto-commit: %+v (%v)", res, err)
+	}
+	raw, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clean := false
+	assertDirtyJSON(t, raw, &clean)
 }
 
 func TestNodeRPCNamesItsMethods(t *testing.T) {

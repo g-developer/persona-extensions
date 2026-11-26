@@ -218,6 +218,92 @@ func TestALateReportOfAnOldAttemptIsRefused(t *testing.T) {
 	}
 }
 
+func TestGetTaskClonesDirtyEvidence(t *testing.T) {
+	q := newTestQueue(t, DefaultQueueConfig())
+	task := mustEnqueue(t, q, EnqueueInput{})
+	_, att, err := q.LeaseTask(task.ID, "dispatcher", testMachine, testStart)
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func() *Task {
+		t.Helper()
+		got, err := q.GetTask(task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	check := func(field string, actual *bool, want bool) {
+		t.Helper()
+		if actual == nil {
+			t.Fatalf("%s dirty is missing", field)
+		}
+		if *actual != want {
+			t.Errorf("%s dirty = %t, want %t", field, *actual, want)
+		}
+	}
+
+	activeDirty := true
+	if _, err := q.UpdateExec(task.ID, att.FenceToken, testStart, func(e *Execution) {
+		e.Dirty = &activeDirty
+	}); err != nil {
+		t.Fatal(err)
+	}
+	activeDirty = false
+	active := get()
+	check("execution", active.Exec.Dirty, true)
+	*active.Exec.Dirty = false
+	check("active attempt", active.Attempts[0].Dirty, true)
+	*active.Attempts[0].Dirty = false
+	stored := get()
+	check("stored execution", stored.Exec.Dirty, true)
+	check("stored active attempt", stored.Attempts[0].Dirty, true)
+
+	completedDirty := false
+	if _, err := q.CompleteAttempt(CompleteAttemptInput{
+		TaskID: task.ID, FenceToken: att.FenceToken, WorkerID: att.WorkerID,
+		Outcome: StateSucceeded, Dirty: &completedDirty, Now: testStart,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	completedDirty = true
+	done := get()
+	check("completed attempt", done.Attempts[0].Dirty, false)
+	*done.Attempts[0].Dirty = true
+	check("report", done.Reports[0].Dirty, false)
+	*done.Reports[0].Dirty = true
+	stored = get()
+	check("stored completed attempt", stored.Attempts[0].Dirty, false)
+	check("stored report", stored.Reports[0].Dirty, false)
+}
+
+func TestQueueLoadsLegacyDirtyEvidence(t *testing.T) {
+	q := newTestQueue(t, DefaultQueueConfig())
+	legacy := `{"version":2,"tasks":[{"id":"task_legacy","exec":{"dirty":true},"attempts":[{"dirty":true},{}],"reports":[{"dirty":true},{}]}]}`
+	if err := os.WriteFile(q.dataFile, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := NewQueue(filepath.Dir(q.dataFile), q.Config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reloaded.GetTask("task_legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Exec == nil || len(got.Attempts) != 2 || len(got.Reports) != 2 {
+		t.Fatal("missing records after loading legacy queue")
+	}
+	for field, dirty := range map[string]*bool{"execution": got.Exec.Dirty, "attempt": got.Attempts[0].Dirty, "report": got.Reports[0].Dirty} {
+		if dirty == nil || !*dirty {
+			t.Errorf("legacy %s lost dirty = true", field)
+		}
+	}
+	if got.Attempts[1].Dirty != nil || got.Reports[1].Dirty != nil {
+		t.Error("missing legacy dirty field should remain unknown")
+	}
+}
+
 func TestRetryDelayIsDeterministicAndGrows(t *testing.T) {
 	base, most := 5*time.Second, 10*time.Minute
 	d1 := ComputeRetryDelay("task_42", 1, base, most)

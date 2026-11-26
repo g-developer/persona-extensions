@@ -109,3 +109,5 @@ Version 0.4.0 replaces the stdio MCP server and the external worker interface of
 ## Version 0.7.6
 
 This release improves scheduling across computers and records more evidence from each attempt. It adds per-task model and launcher overrides, uses each non-Claude engine's own default model, and adds the opt-in `readonly_permission_mode` setting for unattended inspections.
+
+The full task view (`?view=full`) and per-attempt report (`?attempt=N`) carry the stored agent reply and worktree commit SHAs. The compact views include `dirty` when ATS inspected the worktree.

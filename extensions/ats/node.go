@@ -80,7 +80,7 @@ type acceptResult struct {
 	OutputTail string `json:"output_tail,omitempty"`
 	DurationMS int64  `json:"duration_ms"`
 	HeadSHA    string `json:"head_sha,omitempty"`
-	Dirty      bool   `json:"dirty,omitempty"`
+	Dirty      *bool  `json:"dirty,omitempty"`
 }
 
 type releaseParams struct {
@@ -96,10 +96,10 @@ type releaseParams struct {
 
 type releaseResult struct {
 	Removed bool   `json:"removed"`
-	Kept    string `json:"kept,omitempty"` // the worktree, when it was left because of uncommitted work
+	Kept    string `json:"kept,omitempty"`
 	Branch  string `json:"branch,omitempty"`
 	HeadSHA string `json:"head_sha,omitempty"`
-	Dirty   bool   `json:"dirty,omitempty"`
+	Dirty   *bool  `json:"dirty,omitempty"`
 }
 
 func newNodeWorker(data string, repos []string, notify func(string, any)) *nodeWorker {
@@ -354,7 +354,7 @@ func (n *nodeWorker) accept(p acceptParams) error {
 			res.HeadSHA = sha
 		}
 		if dirty, err := worktreeDirty(gctx, dir); err == nil {
-			res.Dirty = dirty
+			res.Dirty = boolPtr(dirty)
 		} else {
 			res.Error = cmpOr(res.Error, "check worktree: "+err.Error())
 		}
@@ -438,8 +438,8 @@ func (n *nodeWorker) acceptStatus(taskID string, attempt int) (acceptResult, err
 	return res, nil
 }
 
-// release stops the attempt's acceptance command if it still runs and removes its worktree. A worktree with
-// uncommitted changes stays, and so does a branch with commits: the work is the user's to look at.
+// release 停止验收命令并尝试移除工作树。无法自动提交的修改、只读任务中产生的提交都会保留工作树。
+// 有新提交的分支会保留。
 func (n *nodeWorker) release(ctx context.Context, p releaseParams) (releaseResult, error) {
 	key, err := attemptKey(p.TaskID, p.Attempt)
 	if err != nil {
@@ -466,15 +466,16 @@ func (n *nodeWorker) release(ctx context.Context, p releaseParams) (releaseResul
 	if b, err := git(ctx, path, "symbolic-ref", "--quiet", "--short", "HEAD"); err == nil {
 		res.Branch = b
 	}
-	res.Dirty, err = worktreeDirty(ctx, path)
+	dirty, err := worktreeDirty(ctx, path)
 	if err != nil {
 		return res, err
 	}
+	res.Dirty = boolPtr(dirty)
 	if p.Readonly && p.BaseSHA != "" && head != p.BaseSHA {
-		res.Dirty, res.Kept = true, path
+		res.Dirty, res.Kept = boolPtr(true), path
 		return res, nil
 	}
-	if res.Dirty {
+	if res.Dirty != nil && *res.Dirty {
 		if res.Branch == "" || strings.TrimSpace(p.CommitMessage) == "" || commitAll(ctx, path, p.CommitMessage) != nil {
 			res.Kept = path
 			return res, nil
@@ -483,9 +484,10 @@ func (n *nodeWorker) release(ctx context.Context, p releaseParams) (releaseResul
 			res.HeadSHA = sha
 		}
 		if dirty, err := worktreeDirty(ctx, path); err != nil || dirty {
-			res.Kept = path // something the commit did not take
+			res.Dirty, res.Kept = boolPtr(true), path
 			return res, nil
 		}
+		res.Dirty = boolPtr(false)
 	}
 	repo, err := n.allowedRepo(p.Repo)
 	if err != nil {

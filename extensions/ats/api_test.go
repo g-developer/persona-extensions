@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -339,12 +341,13 @@ func TestTasksAndEvidencePreserveFullReplyAndExecutionMetadata(t *testing.T) {
 			}
 			want["full_reply"], want["base_sha"] = reply, e.BaseSHA
 			want["head_sha"] = e.BaseSHA
+			want["dirty"] = acceptance != ""
 			if acceptance != "" {
 				releasedHead := runGit(t, r.repo, "rev-parse", e.Branch)
 				if parent := runGit(t, r.repo, "rev-parse", releasedHead+"^"); parent != acceptanceHead {
 					t.Fatalf("release commit parent = %s, want %s", parent, acceptanceHead)
 				}
-				want["head_sha"], want["dirty"] = releasedHead, true
+				want["head_sha"] = releasedHead
 			}
 			assertFields(one.Body["attempts"].([]any)[0].(map[string]any), want)
 			report := call(t, a, "GET", "/tasks/"+task.ID+"/evidence?attempt=1", "").Body["report"].(map[string]any)
@@ -356,6 +359,96 @@ func TestTasksAndEvidencePreserveFullReplyAndExecutionMetadata(t *testing.T) {
 			copy.Attempts[0].FullReply, copy.Reports[0].FullReply = "changed", "changed"
 			assertFields(call(t, a, "GET", "/tasks/"+task.ID+"?view=full", "").Body["attempts"].([]any)[0].(map[string]any), want)
 			assertFields(call(t, a, "GET", "/tasks/"+task.ID+"/evidence?attempt=1", "").Body["report"].(map[string]any), want)
+		})
+	}
+}
+
+func assertDirtyJSON(t *testing.T, raw []byte, want *bool) {
+	t.Helper()
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		t.Fatalf("expected a JSON object: %v", err)
+	}
+	value, present := fields["dirty"]
+	if want == nil {
+		if present || bytes.Contains(raw, []byte(`"dirty":`)) {
+			t.Errorf("uninspected worktree has a dirty field: %v", value)
+		}
+		return
+	}
+	wantField := `"dirty":` + strconv.FormatBool(*want)
+	if !present || value != *want || !bytes.Contains(raw, []byte(wantField)) {
+		t.Errorf("dirty = %v (present: %t), want raw JSON field %s", value, present, wantField)
+	}
+}
+
+func TestTaskAPIReportsDirtyOnlyAfterInspection(t *testing.T) {
+	clean, dirty := false, true
+	for _, tc := range []struct {
+		name, permission, acceptance string
+		edit, failPrepare            bool
+		wantDirty                    *bool
+	}{
+		{name: "clean readonly", acceptance: "true", wantDirty: &clean},
+		{name: "dirty readonly", edit: true, wantDirty: &dirty},
+		{name: "clean writable without acceptance", permission: PermissionDefault, wantDirty: &clean},
+		{name: "uninspected failure", failPrepare: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			zero := 0
+			task := r.enqueue(EnqueueInput{PermissionProfile: tc.permission, AcceptanceCommand: tc.acceptance, MaxRetries: &zero})
+			if tc.failPrepare {
+				r.nodes.fail["ats.prepare"] = errors.New("node unavailable")
+			}
+			r.tick()
+			wantState, wantVerdict := StateFailed, VerdictUnverified
+			if !tc.failPrepare {
+				wantState = StateSucceeded
+				e := r.task(task.ID).Exec
+				if e == nil || e.Phase != PhaseWorking {
+					t.Fatalf("task did not start: %+v", e)
+				}
+				if tc.edit {
+					if err := os.WriteFile(filepath.Join(e.Worktree, "draft.txt"), []byte("draft\n"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				r.hub.turnEnds(e.SessionID, "u1", "Finished.")
+				r.tick()
+				r.tick()
+				if tc.acceptance != "" {
+					wantVerdict = VerdictPass
+					r.waitAccepted(task.ID, 1)
+					r.tick()
+				}
+			}
+			if got := r.task(task.ID); got.State != wantState || got.Verdict != wantVerdict {
+				t.Fatalf("task state and verdict = %s/%s, want %s/%s", got.State, got.Verdict, wantState, wantVerdict)
+			}
+
+			handler := newATSApp(r.q).handler()
+			for _, suffix := range []string{"", "/evidence"} {
+				path := "/tasks/" + task.ID + suffix
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+				if rec.Code != http.StatusOK {
+					t.Fatalf("GET %s returned %d", path, rec.Code)
+				}
+				var body map[string]json.RawMessage
+				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+					t.Fatalf("GET %s: %v", path, err)
+				}
+				raw := body["last_report"]
+				if suffix == "" {
+					var attempts []json.RawMessage
+					if err := json.Unmarshal(body["attempts"], &attempts); err != nil || len(attempts) != 1 {
+						t.Fatalf("GET %s returned %d attempts: %v", path, len(attempts), err)
+					}
+					raw = attempts[0]
+				}
+				assertDirtyJSON(t, raw, tc.wantDirty)
+			}
 		})
 	}
 }

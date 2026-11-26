@@ -747,7 +747,7 @@ func (d *dispatcher) collect(ctx context.Context, t *Task, att Attempt) bool {
 		}
 	}
 	code := res.ExitCode
-	out := outcome{exitCode: &code, summary: e.LastReply, fullReply: e.FullReply, headSHA: res.HeadSHA, dirty: res.Dirty}
+	out := outcome{exitCode: &code, summary: e.LastReply, fullReply: e.FullReply, headSHA: res.HeadSHA, dirty: cloneBoolPtr(res.Dirty)}
 	tail := strings.TrimSpace(res.OutputTail)
 	switch {
 	case res.TimedOut:
@@ -782,7 +782,7 @@ type outcome struct {
 	summary   string // the end of the agent's last reply
 	fullReply string
 	headSHA   string
-	dirty     bool
+	dirty     *bool
 	artifacts []Artifact
 }
 
@@ -808,10 +808,11 @@ func (d *dispatcher) finish(ctx context.Context, t *Task, att Attempt, out outco
 		delete(d.planDeclines, key)
 		d.mu.Unlock()
 	}
-	arts, releasedHeadSHA, dirty := d.cleanup(ctx, t, att.AttemptNo, false)
+	arts, releasedHeadSHA, relDirty := d.cleanup(ctx, t, att.AttemptNo, false)
 	out.headSHA = cmpOr(releasedHeadSHA, out.headSHA)
-	if t.PermissionProfile != PermissionDefault {
-		out.dirty = out.dirty || dirty
+	// 验收发现的修改需要保留为证据，即使释放时已自动提交。
+	if relDirty != nil && (out.dirty == nil || *relDirty) {
+		out.dirty = boolPtr(*relDirty)
 	}
 	out.artifacts = mergeCommit(out.artifacts, releasedHeadSHA, t.Exec)
 	if t.Exec != nil && t.Exec.SessionID != "" {
@@ -879,10 +880,10 @@ func releaseCommitMessage(t *Task, attempt int) string {
 // could not be committed) and, when the attempt is being canceled, the agent's turn. An attempt of a writable
 // task that ends by itself has its uncommitted work committed to its branch. It returns what stays behind as
 // evidence.
-func (d *dispatcher) cleanup(ctx context.Context, t *Task, attempt int, interrupt bool) (arts []Artifact, headSHA string, dirty bool) {
+func (d *dispatcher) cleanup(ctx context.Context, t *Task, attempt int, interrupt bool) (arts []Artifact, headSHA string, dirty *bool) {
 	e := t.Exec
 	if e == nil || e.MachineID == "" {
-		return nil, "", false
+		return nil, "", nil
 	}
 	if interrupt && e.SessionID != "" {
 		ictx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -890,7 +891,7 @@ func (d *dispatcher) cleanup(ctx context.Context, t *Task, attempt int, interrup
 		cancel()
 	}
 	if e.Worktree == "" {
-		return nil, "", false
+		return nil, "", nil
 	}
 	msg := ""
 	if !interrupt && t.PermissionProfile == PermissionDefault {
@@ -902,7 +903,7 @@ func (d *dispatcher) cleanup(ctx context.Context, t *Task, attempt int, interrup
 		Readonly: t.PermissionProfile != PermissionDefault,
 	}, &rel); err != nil {
 		slog.Warn("ATS could not release worktree", "task_id", t.ID, "attempt", attempt, "error", err)
-		return []Artifact{{Kind: "worktree", Path: e.Worktree}}, "", false
+		return []Artifact{{Kind: "worktree", Path: e.Worktree}}, "", nil
 	}
 	headSHA = strings.TrimSpace(rel.HeadSHA)
 	if headSHA != "" && headSHA != e.BaseSHA {
