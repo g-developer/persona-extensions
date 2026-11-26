@@ -299,6 +299,108 @@ func TestSelectedEngineAndPermissionModeReachSessionCreation(t *testing.T) {
 	}
 }
 
+func TestTaskSessionOverridesReachSessionCreation(t *testing.T) {
+	for _, tc := range []struct {
+		name, agentType, difficulty, model, launcher string
+		wantModel, wantLauncher                      string
+	}{
+		{"agy engine default", "agy", DifficultyMedium, "", "", "", "agy"},
+		{"codex engine default", AgentCodex, DifficultyHard, "", "", "", AgentCodex},
+		{"claude explicit overrides", AgentClaude, DifficultyHard, " task-model ", " task-launcher ", "task-model", "task-launcher"},
+		{"agy explicit model", "agy", DifficultyMedium, "agy-model", "", "agy-model", "agy"},
+		{"codex launcher mapped to machine", AgentCodex, DifficultyMedium, "", "other=elsewhere\n MACHINE-1 = task-launcher ", "", "task-launcher"},
+		{"agy launcher map misses machine", "agy", DifficultyMedium, "", "other=elsewhere", "", "agy"},
+		{"claude launcher map misses machine", AgentClaude, DifficultyHard, "", "other=elsewhere", "claude-strong", "claude-machine"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			r.cfg.ModelStandard, r.cfg.ModelStrong = "claude-standard", "claude-strong"
+			r.cfg.Launcher = "claude-default; " + testMachine + "=claude-machine"
+			a := newATSApp(r.q)
+			a.cfg = r.cfg
+			a.nowFunc = func() time.Time { return r.now }
+			body := map[string]string{
+				"todo_id": "todo_1", "prompt": "Inspect the code", "repo": r.repo,
+				"agent_type": tc.agentType, "difficulty": tc.difficulty,
+			}
+			if tc.model != "" {
+				body["model"] = tc.model
+			}
+			if tc.launcher != "" {
+				body["launcher"] = tc.launcher
+			}
+			raw, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ans := call(t, a, "POST", "/tasks", string(raw))
+			if ans.Status != http.StatusCreated {
+				t.Fatalf("enqueue: %d %v", ans.Status, ans.Body)
+			}
+
+			r.tick()
+			if len(r.hub.created) != 1 {
+				t.Fatalf("sessions started: %d", len(r.hub.created))
+			}
+			req := r.hub.created[0]
+			if req.AgentType != tc.agentType || req.Model != tc.wantModel || req.Launcher != tc.wantLauncher {
+				t.Fatalf("session engine %q, model %q, launcher %q; want %q, %q, %q",
+					req.AgentType, req.Model, req.Launcher, tc.agentType, tc.wantModel, tc.wantLauncher)
+			}
+			detail := call(t, a, "GET", "/tasks/"+taskOf(t, ans)["id"].(string), "")
+			view := taskOf(t, detail)
+			if view["launcher"] != tc.wantLauncher ||
+				tc.wantModel != "" && view["model"] != tc.wantModel ||
+				tc.wantModel == "" && view["model"] != nil {
+				t.Fatalf("running task: %v", view)
+			}
+		})
+	}
+}
+
+func TestReadonlyPermissionModeReachesSessionCreation(t *testing.T) {
+	for _, tc := range []struct {
+		name, setting, profile, writeMode, wantMode string
+	}{
+		{"empty setting", "", PermissionReadonly, "auto", "plan"},
+		{"explicit plan", "plan", PermissionReadonly, "auto", "plan"},
+		{"explicit bypass", "bypassPermissions", PermissionReadonly, "auto", "bypassPermissions"},
+		{"invalid setting", "bypassPermissions ", PermissionReadonly, "auto", "plan"},
+		{"write mode stays independent", "bypassPermissions", PermissionDefault, "auto", "auto"},
+		{"default write mode stays independent", "bypassPermissions", PermissionDefault, "", "acceptEdits"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			raw, err := json.Marshal(map[string]string{
+				"readonly_permission_mode": tc.setting, "write_permission_mode": tc.writeMode,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(raw, &r.cfg); err != nil {
+				t.Fatal(err)
+			}
+			r.enqueue(EnqueueInput{PermissionProfile: tc.profile})
+			r.tick()
+			if len(r.hub.created) != 1 {
+				t.Fatalf("sessions started: %d", len(r.hub.created))
+			}
+			req := r.hub.created[0]
+			if req.PermissionMode != tc.wantMode {
+				t.Fatalf("permission mode = %q, want %q", req.PermissionMode, tc.wantMode)
+			}
+			if tc.profile == PermissionReadonly {
+				if !strings.Contains(req.Prompt, "do not change, create or delete files") || !strings.Contains(req.Prompt, "ExitPlanMode") {
+					t.Fatalf("read-only prompt: %s", req.Prompt)
+				}
+				if branch := runGit(t, req.Cwd, "rev-parse", "--abbrev-ref", "HEAD"); branch != "HEAD" {
+					t.Fatalf("read-only task has a branch: %q", branch)
+				}
+			}
+		})
+	}
+}
+
 func TestSynchronousEngineStartGetsTheLongerBudget(t *testing.T) {
 	c := newHubClient("http://example.com", "token")
 	if got := sessionStartTimeout(AgentClaude); got != 30*time.Second {
@@ -745,8 +847,9 @@ func TestUpdateExecRollsBackInMemoryStateOnSaveError(t *testing.T) {
 }
 
 func TestReadonlyTaskAutoDeclinesExitPlanMode(t *testing.T) {
-	t.Run("readonly auto-declines plan exit up to limit and succeeds", func(t *testing.T) {
+	t.Run("readonly bypass auto-declines plan exit up to limit and succeeds", func(t *testing.T) {
 		r := newRig(t)
+		r.cfg.ReadonlyPermissionMode = "bypassPermissions"
 		task := r.enqueue(EnqueueInput{Title: "Readonly plan guard"})
 		r.tick()
 

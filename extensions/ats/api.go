@@ -175,6 +175,7 @@ func viewTask(t *Task, prompt int) taskView {
 			}
 		}
 	}
+	v.Launcher, v.Model = cmpOr(v.Launcher, t.Launcher), cmpOr(v.Model, t.Model)
 	switch prompt {
 	case promptFull:
 		v.Prompt = t.Prompt
@@ -454,6 +455,8 @@ type enqueueRequest struct {
 	Pool              string            `json:"pool"`
 	Machine           string            `json:"machine"`
 	AgentType         string            `json:"agent_type"`
+	Model             string            `json:"model"`
+	Launcher          string            `json:"launcher"`
 	Acceptance        string            `json:"acceptance"`
 	PermissionProfile string            `json:"permission_profile"`
 	Tags              []string          `json:"tags"`
@@ -543,6 +546,7 @@ func (a *atsApp) enqueueInput(req enqueueRequest) (EnqueueInput, error) {
 		IdempotencyKey: strings.TrimSpace(req.IdempotencyKey), Title: strings.TrimSpace(req.Title), Prompt: req.Prompt,
 		Repo: repo, BaseSHA: ref, QoS: strings.TrimSpace(req.QoS), Pool: strings.TrimSpace(req.Pool),
 		Priority: req.Priority, Difficulty: req.Difficulty, Machine: req.Machine, AgentType: req.AgentType,
+		Model: req.Model, Launcher: req.Launcher,
 		AcceptanceCommand: req.Acceptance, PermissionProfile: req.PermissionProfile, Labels: req.Labels, Tags: req.Tags,
 		Source:      AssistantSource,
 		ExternalRef: &ExternalRef{System: AssistantSource, ID: PersonaSystemID, Conversation: todo},

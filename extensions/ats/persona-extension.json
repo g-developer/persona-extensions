@@ -62,6 +62,16 @@
         "maxItems": 32,
         "default": []
       },
+      "readonly_permission_mode": {
+        "type": "string",
+        "title": "只看不改的事，运行命令要不要问你",
+        "description": "默认用计划模式。有些本地网关会在运行命令时卡在等你同意。如果启用了「Bypass 自动允许」，并确认任务在独立的工作目录里做，可以选自动放行。它会跳过权限确认，ATS 仍会要求只看不改，并检查文件有没有改动。",
+        "oneOf": [
+          {"const": "plan", "title": "计划模式（默认）"},
+          {"const": "bypassPermissions", "title": "自动放行，跳过权限确认（有风险）"}
+        ],
+        "default": "plan"
+      },
       "write_permission_mode": {
         "type": "string",
         "title": "要改文件的事，它能自己做主到什么程度",
@@ -132,21 +142,21 @@
       "model_fast": {
         "type": "string",
         "title": "简单的事用哪个模型（可以不填）",
-        "description": "填模型的名字。空着就用默认的模型。简单的事用又快又便宜的模型就够了。",
+        "description": "填模型的名字。空着就用默认的模型。简单的事用又快又便宜的模型就够了。没单独指定模型时，Claude 才会用这里的设置，Codex 和 AGY 会用各自的默认模型。",
         "maxLength": 100,
         "default": ""
       },
       "model_standard": {
         "type": "string",
         "title": "一般的事用哪个模型（可以不填）",
-        "description": "填模型的名字。空着就用默认的模型。",
+        "description": "填模型的名字。空着就用默认的模型。没单独指定模型时，Claude 才会用这里的设置，Codex 和 AGY 会用各自的默认模型。",
         "maxLength": 100,
         "default": ""
       },
       "model_strong": {
         "type": "string",
         "title": "难的事用哪个模型（可以不填）",
-        "description": "填模型的名字。空着就用默认的模型。难的事可以填一个更强的模型。",
+        "description": "填模型的名字。空着就用默认的模型。难的事可以填一个更强的模型。没单独指定模型时，Claude 才会用这里的设置，Codex 和 AGY 会用各自的默认模型。",
         "maxLength": 100,
         "default": ""
       }

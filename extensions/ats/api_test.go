@@ -115,6 +115,125 @@ func TestPostTaskCanChooseAnEngine(t *testing.T) {
 	}
 }
 
+func TestPostTaskPreservesSessionOverridesAfterReloadAndReplay(t *testing.T) {
+	a := newTestApp(t)
+	body := strings.TrimSuffix(validTask, "}") +
+		`,"agent_type":"agy","model":"  provider/task-model  ","launcher":" machine-1=local\nmachine-2=remote ","idempotency_key":"overrides"}`
+	first := call(t, a, "POST", "/tasks", body)
+	if first.Status != http.StatusCreated || first.Body["created"] != true {
+		t.Fatalf("create: %d %v", first.Status, first.Body)
+	}
+	id := taskOf(t, first)["id"].(string)
+	check := func(ans apiAnswer) {
+		t.Helper()
+		task := taskOf(t, ans)
+		if task["id"] != id || task["model"] != "provider/task-model" || task["launcher"] != "machine-1=local\nmachine-2=remote" {
+			t.Fatalf("task after requesting session overrides: %v", task)
+		}
+	}
+	check(first)
+
+	reloaded, err := NewQueue(filepath.Dir(a.queue.dataFile), a.queue.Config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.queue = reloaded
+	detail := call(t, a, "GET", "/tasks/"+id, "")
+	if detail.Status != http.StatusOK {
+		t.Fatalf("read after reload: %d %v", detail.Status, detail.Body)
+	}
+	check(detail)
+
+	body = strings.TrimSuffix(validTask, "}") + `,"model":"other-model","launcher":"other-launcher","idempotency_key":"overrides"}`
+	replay := call(t, a, "POST", "/tasks", body)
+	if replay.Status != http.StatusOK || replay.Body["created"] != false {
+		t.Fatalf("replay: %d %v", replay.Status, replay.Body)
+	}
+	check(replay)
+}
+
+func TestPostTaskValidatesSessionOverrides(t *testing.T) {
+	maxModel := strings.Repeat("é", 64)
+	maxLauncher := strings.Repeat("é", 256)
+	for _, tc := range []struct {
+		name, field, value, want string
+		reject                   bool
+	}{
+		{"empty model", "model", "  ", "", false},
+		{"empty launcher", "launcher", "  ", "", false},
+		{"model byte limit", "model", " " + maxModel + " ", maxModel, false},
+		{"launcher byte limit", "launcher", " " + maxLauncher + " ", maxLauncher, false},
+		{"single launcher with spaces", "launcher", "  local launcher  ", "local launcher", false},
+		{"launcher map separators", "launcher", " default, m1 = one; m2=two\nm3=three ", "default, m1 = one; m2=two\nm3=three", false},
+		{"model space", "model", "vendor/bad model", "", true},
+		{"model unicode space", "model", "vendor/bad\u00a0model", "", true},
+		{"model tab", "model", "vendor/bad\tmodel", "", true},
+		{"model leading control", "model", "\tmodel", "", true},
+		{"model newline", "model", "vendor/bad\nmodel", "", true},
+		{"model NUL", "model", "bad\x00model", "", true},
+		{"model control", "model", "bad\x1bmodel", "", true},
+		{"model too long", "model", maxModel + "a", "", true},
+		{"launcher NUL", "launcher", "bad\x00launcher", "", true},
+		{"launcher tab", "launcher", "m1=bad\tlauncher", "", true},
+		{"launcher trailing control", "launcher", "launcher\t", "", true},
+		{"launcher carriage return", "launcher", "m1=one\r\nm2=two", "", true},
+		{"launcher DEL", "launcher", "bad\x7flauncher", "", true},
+		{"launcher newline outside a map", "launcher", "bad\nlauncher", "", true},
+		{"launcher too long", "launcher", maxLauncher + "a", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newTestApp(t)
+			value, err := json.Marshal(tc.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := strings.TrimSuffix(validTask, "}") + `,"` + tc.field + `":` + string(value) + "}"
+			ans := call(t, a, "POST", "/tasks", body)
+			if tc.reject {
+				if ans.Status != http.StatusBadRequest || ans.Code != "invalid" || !strings.Contains(ans.Error, tc.field) {
+					t.Fatalf("invalid %s: %d %s %s", tc.field, ans.Status, ans.Code, ans.Error)
+				}
+				tasks, err := a.queue.ListTasks(TaskFilter{})
+				if err != nil || len(tasks) != 0 {
+					t.Fatalf("invalid override left %d tasks: %v", len(tasks), err)
+				}
+				return
+			}
+			if ans.Status != http.StatusCreated {
+				t.Fatalf("valid %s: %d %v", tc.field, ans.Status, ans.Body)
+			}
+			got, present := taskOf(t, ans)[tc.field]
+			if tc.want == "" {
+				if present {
+					t.Fatalf("empty %s was exposed as %q", tc.field, got)
+				}
+			} else if got != tc.want {
+				t.Fatalf("%s = %q, want %q", tc.field, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTaskViewPrefersExecutionMetadataToRequestedOverrides(t *testing.T) {
+	task := &Task{Launcher: "requested-launcher", Model: "requested-model"}
+	check := func(wantLauncher, wantModel string) {
+		t.Helper()
+		if got := viewTask(task, promptNone); got.Launcher != wantLauncher || got.Model != wantModel {
+			t.Fatalf("view launcher %q, model %q; want %q, %q", got.Launcher, got.Model, wantLauncher, wantModel)
+		}
+	}
+	check("requested-launcher", "requested-model")
+	task.Reports = []EvidenceReport{{AttemptNo: 1, Launcher: "report-launcher", Model: "report-model"}}
+	check("report-launcher", "report-model")
+	task.Attempts = []Attempt{{AttemptNo: 1, Launcher: "attempt-launcher"}}
+	check("attempt-launcher", "report-model")
+	task.Exec = &Execution{Launcher: "active-launcher", Model: "active-model"}
+	check("active-launcher", "active-model")
+	task.Exec = nil
+	task.Attempts = append(task.Attempts, Attempt{AttemptNo: 2})
+	check("requested-launcher", "requested-model")
+}
+
 func TestPostTaskAcceptsLargePromptsAndBodies(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -613,8 +732,9 @@ func TestManifest(t *testing.T) {
 	// The defaults the settings show are the ones the program uses when nothing is set.
 	def := defaultExtConfig()
 	for key, want := range map[string]any{
-		"launcher":              def.Launcher,
-		"write_permission_mode": def.WritePermissionMode, "parallel_per_machine": float64(def.ParallelPerMachine),
+		"launcher":                 def.Launcher,
+		"readonly_permission_mode": def.readonlyMode(),
+		"write_permission_mode":    def.WritePermissionMode, "parallel_per_machine": float64(def.ParallelPerMachine),
 		"task_timeout_minutes": float64(def.TaskTimeoutMinutes), "acceptance_timeout_minutes": float64(def.AcceptTimeoutMinutes),
 		"max_queued": float64(def.MaxQueued), "max_retries": float64(def.MaxRetries), "reserve_headroom_pct": float64(def.ReserveHeadroomPct),
 	} {

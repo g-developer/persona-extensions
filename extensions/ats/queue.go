@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // Task states in the self-contained ATS state machine.
@@ -214,6 +215,8 @@ type Task struct {
 	QuotaWeight        float64           `json:"quota_weight"`
 	Machine            string            `json:"machine,omitempty"`
 	AgentType          string            `json:"agent_type,omitempty"`
+	Model              string            `json:"model,omitempty"`
+	Launcher           string            `json:"launcher,omitempty"`
 	PermissionProfile  string            `json:"permission_profile"`
 	Workspace          WorkspaceSpec     `json:"workspace"`
 	Acceptance         *AcceptanceSpec   `json:"acceptance,omitempty"`
@@ -338,6 +341,26 @@ func NormalizeAgentType(raw string) (string, error) {
 		return "", errors.New("agent_type must be a lowercase engine identifier of 1-32 letters, digits, _ or -")
 	}
 	return s, nil
+}
+
+func normalizeModel(raw string) (string, error) {
+	model := strings.TrimSpace(raw)
+	if len(model) > 128 || strings.ContainsFunc(raw, unicode.IsControl) || strings.ContainsFunc(model, unicode.IsSpace) {
+		return "", errors.New("model must be at most 128 bytes with no internal whitespace or control characters")
+	}
+	return model, nil
+}
+
+func normalizeLauncher(raw string) (string, error) {
+	launcher := strings.TrimSpace(raw)
+	// 含机器映射的配置可以用换行分隔条目。
+	mapSpec := strings.ContainsRune(launcher, '=')
+	if len(launcher) > 512 || strings.ContainsFunc(raw, func(r rune) bool {
+		return (r < 0x20 || r == 0x7f) && (r != '\n' || !mapSpec)
+	}) {
+		return "", errors.New("launcher must be at most 512 bytes with no control characters except newlines in a machine map")
+	}
+	return launcher, nil
 }
 
 // effectiveAgentType supplies the legacy default without rewriting old queue records.
@@ -562,6 +585,8 @@ type EnqueueInput struct {
 	Difficulty        string
 	Machine           string
 	AgentType         string
+	Model             string
+	Launcher          string
 	AcceptanceCommand string
 	PermissionProfile string
 	Labels            map[string]string
@@ -908,6 +933,14 @@ func (q *Queue) Enqueue(in EnqueueInput) (EnqueueResult, error) {
 	if err != nil {
 		return EnqueueResult{}, err
 	}
+	model, err := normalizeModel(in.Model)
+	if err != nil {
+		return EnqueueResult{}, err
+	}
+	launcher, err := normalizeLauncher(in.Launcher)
+	if err != nil {
+		return EnqueueResult{}, err
+	}
 
 	prio, diff, tier, machine, weight, labels, err := ExtractSchedulingTags(
 		in.Priority,
@@ -1028,6 +1061,8 @@ func (q *Queue) Enqueue(in EnqueueInput) (EnqueueResult, error) {
 		QuotaWeight:       weight,
 		Machine:           machine,
 		AgentType:         agentType,
+		Model:             model,
+		Launcher:          launcher,
 		PermissionProfile: perm,
 		Workspace: WorkspaceSpec{
 			Repo:    repo,

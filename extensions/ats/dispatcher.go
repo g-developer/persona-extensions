@@ -239,17 +239,24 @@ func (d *dispatcher) prepare(ctx context.Context, t *Task, att Attempt) bool {
 	t = updated
 	e = t.Exec
 
-	mode := "plan"
+	mode := cfg.readonlyMode()
 	if !readonly {
 		mode = cfg.writeMode()
 	}
 	agentType := effectiveAgentType(att.Harness, t.AgentType)
-	launcher := cfg.launcherFor(e.MachineID)
-	if agentType != AgentClaude {
-		// AgentType alone does not stop the hub's default Claude launcher from being picked.
-		launcher = agentType
+	launcher := launcherForSpec(t.Launcher, e.MachineID)
+	if launcher == "" {
+		if agentType == AgentClaude {
+			launcher = cfg.launcherFor(e.MachineID)
+		} else {
+			// 只指定引擎时，Hub 仍可能选用默认的 Claude 启动器。
+			launcher = agentType
+		}
 	}
-	model := cfg.model(cmpOr(att.ModelTier, t.ModelTier))
+	model := strings.TrimSpace(t.Model)
+	if model == "" && agentType == AgentClaude {
+		model = cfg.model(cmpOr(att.ModelTier, t.ModelTier))
+	}
 	cctx, cancel := context.WithTimeout(ctx, sessionStartTimeout(agentType))
 	sid, err := d.api.CreateSession(cctx, sessionRequest{
 		MachineID: e.MachineID, Cwd: ws.Path, AgentType: agentType, Launcher: launcher, Prompt: buildPrompt(t, ws, readonly, prev, resume != ""),
