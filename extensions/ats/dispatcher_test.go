@@ -244,6 +244,107 @@ func TestWritingTaskRunsInItsOwnWorktreeAndPassesAcceptance(t *testing.T) {
 	}
 }
 
+func TestWritingTaskRecordsReleasedHead(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
+	for _, tc := range []struct {
+		name, acceptance string
+		pendingEdits     bool
+		afterAcceptance  string
+	}{
+		{name: "agent commit without acceptance"},
+		{name: "release commits without acceptance", pendingEdits: true},
+		{name: "release commits after acceptance", acceptance: "test -f work.txt", pendingEdits: true},
+		{name: "release has no head", acceptance: "test -f work.txt", afterAcceptance: "remove worktree"},
+		{name: "release finds the base", acceptance: "test -f work.txt", afterAcceptance: "restore base"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			task := r.enqueue(EnqueueInput{Title: "Record work", PermissionProfile: PermissionDefault, AcceptanceCommand: tc.acceptance})
+			r.tick()
+			e := r.task(task.ID).Exec
+			if e == nil || e.Phase != PhaseWorking {
+				t.Fatalf("worktree was not prepared: %+v", e)
+			}
+			if err := os.WriteFile(filepath.Join(e.Worktree, "work.txt"), []byte("work\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runGit(t, e.Worktree, "add", "work.txt")
+			runGit(t, e.Worktree, "commit", "-qm", "agent work")
+			agentHead := runGit(t, e.Worktree, "rev-parse", "HEAD")
+			if tc.pendingEdits {
+				if err := os.WriteFile(filepath.Join(e.Worktree, "pending.txt"), []byte("pending\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			r.hub.turnEnds(e.SessionID, "u1", "Changed the files.")
+			r.tick()
+			r.tick()
+			wantVerdict := VerdictUnverified
+			if tc.acceptance != "" {
+				wantVerdict = VerdictPass
+				r.waitAccepted(task.ID, 1)
+				accepted, err := r.worker.acceptStatus(task.ID, 1)
+				if err != nil || accepted.HeadSHA != agentHead || accepted.ExitCode != 0 {
+					t.Fatalf("acceptance: %+v (%v), want commit %s and exit 0", accepted, err, agentHead)
+				}
+				switch tc.afterAcceptance {
+				case "remove worktree":
+					runGit(t, r.repo, "worktree", "remove", e.Worktree)
+				case "restore base":
+					runGit(t, e.Worktree, "reset", "--hard", e.BaseSHA)
+				}
+				r.tick()
+			}
+
+			head := e.BaseSHA
+			if tc.afterAcceptance != "restore base" {
+				head = runGit(t, r.repo, "rev-parse", e.Branch)
+			}
+			if tc.pendingEdits {
+				if parent := runGit(t, r.repo, "rev-parse", head+"^"); parent != agentHead {
+					t.Fatalf("release commit parent = %s, want %s", parent, agentHead)
+				}
+				if got := runGit(t, r.repo, "show", head+":pending.txt"); got != "pending" {
+					t.Fatalf("release commit contains %q in pending.txt", got)
+				}
+			} else if tc.afterAcceptance != "restore base" && head != agentHead {
+				t.Fatalf("branch head = %s, want %s", head, agentHead)
+			}
+
+			q, err := NewQueue(filepath.Dir(r.q.dataFile), r.cfg.queueConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := q.GetTask(task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.State != StateSucceeded || got.Verdict != wantVerdict || len(got.Attempts) != 1 || len(got.Reports) != 1 {
+				t.Fatalf("reloaded task: state %s, verdict %s, attempts %d, reports %d", got.State, got.Verdict, len(got.Attempts), len(got.Reports))
+			}
+			report := got.Reports[0]
+			if got.Attempts[0].HeadSHA != head || report.HeadSHA != head {
+				t.Errorf("persisted head_sha = %q in attempt and %q in report, want %s", got.Attempts[0].HeadSHA, report.HeadSHA, head)
+			}
+			var commits []string
+			for _, a := range report.Artifacts {
+				if a.Kind == "commit" {
+					commits = append(commits, a.Path)
+				}
+			}
+			var wantCommits []string
+			if head != e.BaseSHA {
+				wantCommits = []string{head}
+			}
+			if !slices.Equal(commits, wantCommits) {
+				t.Errorf("commit artifacts = %v, want %v", commits, wantCommits)
+			}
+		})
+	}
+}
+
 func TestReadonlyTaskRunsInPlanModeAndEndsUnverifiedWithoutAcceptance(t *testing.T) {
 	r := newRig(t)
 	r.cfg.ModelStandard = "example-model"

@@ -473,7 +473,7 @@ func (a *atsApp) postTask(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, &apiError{Code: "forbidden", Msg: "this caller may not queue tasks"})
 		return
 	}
-	var req enqueueRequest
+	req := enqueueRequest{Ref: "HEAD"}
 	dec := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
@@ -523,9 +523,8 @@ func (a *atsApp) enqueueInput(req enqueueRequest) (EnqueueInput, error) {
 	if err != nil {
 		return EnqueueInput{}, err
 	}
-	ref := strings.TrimSpace(req.Ref)
-	if strings.HasPrefix(ref, "-") || strings.ContainsAny(ref, " \t\n\x00") || len(ref) > 200 {
-		return EnqueueInput{}, badRequest("invalid_ref", "ref must be a branch, tag or commit")
+	if err := validateRef(req.Ref); err != nil {
+		return EnqueueInput{}, badRequest("invalid_ref", invalidRefMessage)
 	}
 	switch strings.TrimSpace(req.QoS) {
 	case "", "expedited", "standard", "bulk":
@@ -544,7 +543,7 @@ func (a *atsApp) enqueueInput(req enqueueRequest) (EnqueueInput, error) {
 	}
 	return EnqueueInput{
 		IdempotencyKey: strings.TrimSpace(req.IdempotencyKey), Title: strings.TrimSpace(req.Title), Prompt: req.Prompt,
-		Repo: repo, BaseSHA: ref, QoS: strings.TrimSpace(req.QoS), Pool: strings.TrimSpace(req.Pool),
+		Repo: repo, BaseSHA: req.Ref, QoS: strings.TrimSpace(req.QoS), Pool: strings.TrimSpace(req.Pool),
 		Priority: req.Priority, Difficulty: req.Difficulty, Machine: req.Machine, AgentType: req.AgentType,
 		Model: req.Model, Launcher: req.Launcher,
 		AcceptanceCommand: req.Acceptance, PermissionProfile: req.PermissionProfile, Labels: req.Labels, Tags: req.Tags,

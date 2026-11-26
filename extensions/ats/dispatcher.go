@@ -808,11 +808,12 @@ func (d *dispatcher) finish(ctx context.Context, t *Task, att Attempt, out outco
 		delete(d.planDeclines, key)
 		d.mu.Unlock()
 	}
-	arts, dirty := d.cleanup(ctx, t, att.AttemptNo, false)
+	arts, releasedHeadSHA, dirty := d.cleanup(ctx, t, att.AttemptNo, false)
+	out.headSHA = cmpOr(releasedHeadSHA, out.headSHA)
 	if t.PermissionProfile != PermissionDefault {
 		out.dirty = out.dirty || dirty
 	}
-	out.artifacts = mergeCommit(out.artifacts, arts, t.Exec)
+	out.artifacts = mergeCommit(out.artifacts, releasedHeadSHA, t.Exec)
 	if t.Exec != nil && t.Exec.SessionID != "" {
 		arts = append(arts, Artifact{Kind: "session", Path: t.Exec.MachineID + "/" + t.Exec.SessionID})
 	}
@@ -847,23 +848,15 @@ func (d *dispatcher) finish(ctx context.Context, t *Task, att Attempt, out outco
 	cancel()
 }
 
-// mergeCommit leaves one commit in an attempt's evidence: the head the release found (it has the work ATS
-// committed itself) rather than the one the acceptance command ran on, and none when the branch never left the
-// commit the attempt started from.
-func mergeCommit(own, released []Artifact, e *Execution) []Artifact {
+// mergeCommit 优先采用 release 读取的最终 HEAD。只有偏离起点的提交进入证据。
+func mergeCommit(own []Artifact, releasedHeadSHA string, e *Execution) []Artifact {
 	base := ""
 	if e != nil {
 		base = e.BaseSHA
 	}
-	hasReleased := false
-	for _, a := range released {
-		if a.Kind == "commit" {
-			hasReleased = true
-		}
-	}
 	var out []Artifact
 	for _, a := range own {
-		if a.Kind == "commit" && (hasReleased || (base != "" && a.Path == base)) {
+		if a.Kind == "commit" && (releasedHeadSHA != "" || (base != "" && a.Path == base)) {
 			continue
 		}
 		out = append(out, a)
@@ -886,10 +879,10 @@ func releaseCommitMessage(t *Task, attempt int) string {
 // could not be committed) and, when the attempt is being canceled, the agent's turn. An attempt of a writable
 // task that ends by itself has its uncommitted work committed to its branch. It returns what stays behind as
 // evidence.
-func (d *dispatcher) cleanup(ctx context.Context, t *Task, attempt int, interrupt bool) ([]Artifact, bool) {
+func (d *dispatcher) cleanup(ctx context.Context, t *Task, attempt int, interrupt bool) (arts []Artifact, headSHA string, dirty bool) {
 	e := t.Exec
 	if e == nil || e.MachineID == "" {
-		return nil, false
+		return nil, "", false
 	}
 	if interrupt && e.SessionID != "" {
 		ictx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -897,7 +890,7 @@ func (d *dispatcher) cleanup(ctx context.Context, t *Task, attempt int, interrup
 		cancel()
 	}
 	if e.Worktree == "" {
-		return nil, false
+		return nil, "", false
 	}
 	msg := ""
 	if !interrupt && t.PermissionProfile == PermissionDefault {
@@ -909,11 +902,11 @@ func (d *dispatcher) cleanup(ctx context.Context, t *Task, attempt int, interrup
 		Readonly: t.PermissionProfile != PermissionDefault,
 	}, &rel); err != nil {
 		slog.Warn("ATS could not release worktree", "task_id", t.ID, "attempt", attempt, "error", err)
-		return []Artifact{{Kind: "worktree", Path: e.Worktree}}, false
+		return []Artifact{{Kind: "worktree", Path: e.Worktree}}, "", false
 	}
-	var arts []Artifact
-	if rel.HeadSHA != "" && rel.HeadSHA != e.BaseSHA {
-		arts = append(arts, Artifact{Kind: "commit", Path: rel.HeadSHA})
+	headSHA = strings.TrimSpace(rel.HeadSHA)
+	if headSHA != "" && headSHA != e.BaseSHA {
+		arts = append(arts, Artifact{Kind: "commit", Path: headSHA})
 	}
 	if rel.Branch != "" {
 		arts = append(arts, Artifact{Kind: "branch", Path: rel.Branch})
@@ -921,7 +914,7 @@ func (d *dispatcher) cleanup(ctx context.Context, t *Task, attempt int, interrup
 	if rel.Kept != "" {
 		arts = append(arts, Artifact{Kind: "worktree", Path: rel.Kept})
 	}
-	return arts, rel.Dirty
+	return arts, headSHA, rel.Dirty
 }
 
 // cancel cancels a task from the queue page: the queue first, then what its attempt holds.

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/nwverse/persona/sdk/go/ext"
 )
@@ -32,9 +33,11 @@ const (
 	outputTailBytes   = 4 << 10
 	defaultAcceptTime = 10 * time.Minute
 	maxAcceptTime     = 60 * time.Minute
+	invalidRefMessage = "ref must be a branch, tag or commit"
 )
 
 var safeIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,80}$`)
+var errInvalidRef = errors.New("invalid_ref: " + invalidRefMessage)
 
 type nodeWorker struct {
 	data   string
@@ -49,7 +52,7 @@ type prepareParams struct {
 	TaskID   string `json:"task_id"`
 	Attempt  int    `json:"attempt"`
 	Repo     string `json:"repo"`
-	Ref      string `json:"ref"`
+	Ref      string `json:"ref,omitempty"`
 	Readonly bool   `json:"readonly"`
 }
 
@@ -229,9 +232,25 @@ func worktreeDirty(ctx context.Context, dir string) (bool, error) {
 	return status != "", err
 }
 
+func validateRef(ref string) error {
+	if ref == "" || len(ref) > 200 || strings.HasPrefix(ref, "-") || strings.HasPrefix(ref, "+") ||
+		strings.HasPrefix(ref, "^") || strings.ContainsRune(ref, ':') {
+		return errInvalidRef
+	}
+	for _, r := range ref {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return errInvalidRef
+		}
+	}
+	return nil
+}
+
 // resolveCommit finds ref in repo, fetching configured remotes if the commit is missing locally so
 // multi-machine tasks sharing a Git remote can run seamlessly on another node.
 func resolveCommit(ctx context.Context, repo, ref string) (string, error) {
+	if err := validateRef(ref); err != nil {
+		return "", err
+	}
 	if sha, err := git(ctx, repo, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err == nil && sha != "" {
 		return sha, nil
 	}
@@ -244,7 +263,8 @@ func resolveCommit(ctx context.Context, repo, ref string) (string, error) {
 		return sha, nil
 	}
 	if ref != "HEAD" {
-		if _, ferr := git(ctx, repo, "fetch", "--quiet", "origin", ref); ferr == nil {
+		// 禁用远端的引用映射，使定向 fetch 只记录 FETCH_HEAD。
+		if _, ferr := git(ctx, repo, "fetch", "--no-tags", "--quiet", "--refmap=", "origin", "--", ref); ferr == nil {
 			if sha, err := git(ctx, repo, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err == nil && sha != "" {
 				return sha, nil
 			}
@@ -265,12 +285,9 @@ func (n *nodeWorker) prepare(ctx context.Context, p prepareParams) (prepareResul
 	if err != nil {
 		return prepareResult{}, err
 	}
-	ref := strings.TrimSpace(p.Ref)
-	if ref == "" {
-		ref = "HEAD"
-	}
-	if strings.HasPrefix(ref, "-") {
-		return prepareResult{}, errors.New("ref must be a commit-ish that does not start with -")
+	ref := cmpOr(p.Ref, "HEAD")
+	if err := validateRef(ref); err != nil {
+		return prepareResult{}, err
 	}
 	sha, err := resolveCommit(ctx, repo, ref)
 	if err != nil {
@@ -570,9 +587,12 @@ func nodeProgram(id, version string) ext.Program {
 func (n *nodeWorker) rpc(ctx context.Context, method string, params json.RawMessage) (any, error) {
 	switch method {
 	case "prepare":
-		var p prepareParams
+		p := prepareParams{Ref: "HEAD"}
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
+		}
+		if p.Ref == "" {
+			return nil, errInvalidRef
 		}
 		return n.prepare(ctx, p)
 	case "accept":

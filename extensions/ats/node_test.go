@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -153,6 +154,69 @@ func TestPrepareRefusesWhatTheAllowlistDoesNotCover(t *testing.T) {
 	empty, _ := newTestWorker(t)
 	if _, err := empty.prepare(t.Context(), prepareParams{TaskID: "t", Attempt: 1, Repo: repo}); err == nil || !strings.Contains(err.Error(), "repo_not_allowed") {
 		t.Fatalf("an empty allowlist allowed a repository: %v", err)
+	}
+}
+
+func TestPrepareAndResolveCommitRejectUnsafeRefs(t *testing.T) {
+	repo := t.TempDir()
+	w, _ := newTestWorker(t, repo)
+	for _, tc := range []struct{ name, ref string }{
+		{"forced refspec", "+refs/heads/main:refs/heads/other"},
+		{"refspec with destination", "main:other"},
+		{"option", "--force"},
+		{"force prefix", "+main"},
+		{"negative refspec", "^main"},
+		{"blank", " \t"},
+		{"trailing newline", "main\n"},
+		{"whitespace", "main\rother"},
+		{"NUL", "main\x00other"},
+		{"control character", "main\x7fother"},
+		{"over the byte limit", strings.Repeat("x", 201)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := prepareParams{TaskID: "unsafe", Attempt: 1, Repo: repo, Ref: tc.ref}
+			if _, err := w.prepare(t.Context(), p); err == nil || !strings.HasPrefix(err.Error(), "invalid_ref:") {
+				t.Errorf("prepare with ref %q: got %v, want invalid_ref", tc.ref, err)
+			}
+			if _, err := resolveCommit(t.Context(), repo, tc.ref); err == nil || !strings.HasPrefix(err.Error(), "invalid_ref:") {
+				t.Errorf("resolveCommit with ref %q: got %v, want invalid_ref", tc.ref, err)
+			}
+		})
+	}
+	if _, err := resolveCommit(t.Context(), repo, ""); err == nil || !strings.HasPrefix(err.Error(), "invalid_ref:") {
+		t.Errorf("resolveCommit with an empty ref: got %v, want invalid_ref", err)
+	}
+}
+
+func TestPrepareRPCRejectsExplicitlyEmptyRef(t *testing.T) {
+	root, repo := newTestRepo(t)
+	w, _ := newTestWorker(t, root)
+	params, err := json.Marshal(map[string]any{"task_id": "unsafe", "attempt": 1, "repo": repo, "ref": ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.rpc(t.Context(), "prepare", params); err == nil || !strings.HasPrefix(err.Error(), "invalid_ref:") {
+		t.Fatalf("ats.prepare with an empty ref: got %v, want invalid_ref", err)
+	}
+}
+
+func TestResolveCommitAcceptsCommitishRefs(t *testing.T) {
+	_, repo := newTestRepo(t)
+	first := runGit(t, repo, "rev-parse", "HEAD")
+	short := runGit(t, repo, "rev-parse", "--short", first)
+	runGit(t, repo, "tag", "-a", "v1.0.0", "-m", "release", first)
+	runGit(t, repo, "branch", "feature/foo", first)
+	runGit(t, repo, "commit", "-qm", "second", "--allow-empty")
+	head := runGit(t, repo, "rev-parse", "HEAD")
+	for _, tc := range []struct{ ref, want string }{
+		{"main", head}, {"HEAD", head}, {"refs/heads/main", head}, {"v1.0.0", first},
+		{"feature/foo", first}, {first, first}, {short, first}, {"HEAD^", first}, {"HEAD~1", first}, {"HEAD@{0}", head},
+	} {
+		t.Run(tc.ref, func(t *testing.T) {
+			if got, err := resolveCommit(t.Context(), repo, tc.ref); err != nil || got != tc.want {
+				t.Fatalf("resolveCommit(%q) = %q, %v, want %s", tc.ref, got, err, tc.want)
+			}
+		})
 	}
 }
 
@@ -330,5 +394,53 @@ func TestPrepareFetchesMissingRefFromRemote(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(res.Path, "round5.txt"))
 	if err != nil || string(data) != "round5\n" {
 		t.Fatalf("fetched worktree missing round5.txt: err=%v data=%q", err, string(data))
+	}
+}
+
+func TestPrepareTargetedFetchKeepsRepositoryRefs(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
+	root, repo := newTestRepo(t)
+	protected := runGit(t, repo, "rev-parse", "HEAD")
+	runGit(t, repo, "branch", "other", protected)
+	refs := runGit(t, repo, "show-ref")
+
+	source, bare := filepath.Join(root, "source"), filepath.Join(root, "origin.git")
+	runGit(t, root, "clone", "-q", repo, source)
+	runGit(t, source, "commit", "-qm", "remote commit", "--allow-empty")
+	want := runGit(t, source, "rev-parse", "HEAD")
+	runGit(t, source, "branch", "feature/remote", want)
+	runGit(t, source, "tag", "v1.0.0", want)
+	runGit(t, root, "clone", "--bare", "-q", source, bare)
+	runGit(t, repo, "remote", "add", "origin", bare)
+	// 让常规 fetch --all 跳过 origin，以实际执行单个引用的 fetch。
+	runGit(t, repo, "config", "remote.origin.skipFetchAll", "true")
+
+	w, _ := newTestWorker(t, root)
+	res, err := w.prepare(t.Context(), prepareParams{TaskID: "remote", Attempt: 1, Repo: repo, Ref: "refs/heads/feature/remote", Readonly: true})
+	if err != nil || res.BaseSHA != want {
+		t.Fatalf("prepare with remote ref: got %+v, %v, want %s", res, err, want)
+	}
+	if got := runGit(t, res.Path, "rev-parse", "HEAD"); got != want {
+		t.Fatalf("worktree HEAD = %s, want %s", got, want)
+	}
+	if got := runGit(t, repo, "rev-parse", "FETCH_HEAD^{commit}"); got != want {
+		t.Fatalf("FETCH_HEAD = %s, want %s", got, want)
+	}
+	if got := runGit(t, repo, "show-ref"); got != refs {
+		t.Fatalf("targeted fetch changed refs:\n%s\nwant:\n%s", got, refs)
+	}
+
+	for _, ref := range []string{"+refs/heads/main:refs/heads/other", "main:other"} {
+		p := prepareParams{TaskID: "unsafe", Attempt: 1, Repo: repo, Ref: ref}
+		if _, err := w.prepare(t.Context(), p); err == nil || !strings.HasPrefix(err.Error(), "invalid_ref:") {
+			t.Errorf("prepare with ref %q: got %v, want invalid_ref", ref, err)
+		}
+		if got := runGit(t, repo, "rev-parse", "refs/heads/other"); got != protected {
+			t.Errorf("prepare with ref %q moved other from %s to %s", ref, protected, got)
+		}
+	}
+	if _, err := os.Stat(w.worktree("unsafe-1")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected refs left a worktree: %v", err)
 	}
 }

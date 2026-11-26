@@ -74,7 +74,8 @@ func TestPostTaskQueuesAReadOnlyTaskForTheTodo(t *testing.T) {
 	}
 	task := taskOf(t, ans)
 	if task["state"] != StateQueued || task["permission_profile"] != PermissionReadonly || task["todo_id"] != "todo_1" ||
-		task["priority"] != PriorityP2 || task["repo"] != "/srv/code/app" || task["acceptance"] != "go test ./..." || task["agent_type"] != AgentClaude {
+		task["priority"] != PriorityP2 || task["repo"] != "/srv/code/app" || task["ref"] != "HEAD" ||
+		task["acceptance"] != "go test ./..." || task["agent_type"] != AgentClaude {
 		t.Fatalf("task: %v", task)
 	}
 	stored, err := a.queue.GetTask(task["id"].(string))
@@ -298,14 +299,14 @@ func TestTasksAndEvidencePreserveFullReplyAndExecutionMetadata(t *testing.T) {
 			assertFields(one.Body["attempts"].([]any)[0].(map[string]any), want)
 			assertFields(call(t, a, "GET", "/tasks/"+task.ID+"/evidence", "").Body, want)
 
-			head := ""
+			var acceptanceHead string
 			if acceptance != "" {
 				if err := os.WriteFile(e.Worktree+"/done.txt", []byte("committed\n"), 0o644); err != nil {
 					t.Fatal(err)
 				}
 				runGit(t, e.Worktree, "add", ".")
 				runGit(t, e.Worktree, "commit", "-q", "-m", "work")
-				head = runGit(t, e.Worktree, "rev-parse", "HEAD")
+				acceptanceHead = runGit(t, e.Worktree, "rev-parse", "HEAD")
 				if err := os.WriteFile(e.Worktree+"/done.txt", []byte("uncommitted\n"), 0o644); err != nil {
 					t.Fatal(err)
 				}
@@ -337,8 +338,13 @@ func TestTasksAndEvidencePreserveFullReplyAndExecutionMetadata(t *testing.T) {
 				t.Fatal("the compact report carried the full reply")
 			}
 			want["full_reply"], want["base_sha"] = reply, e.BaseSHA
+			want["head_sha"] = e.BaseSHA
 			if acceptance != "" {
-				want["head_sha"], want["dirty"] = head, true
+				releasedHead := runGit(t, r.repo, "rev-parse", e.Branch)
+				if parent := runGit(t, r.repo, "rev-parse", releasedHead+"^"); parent != acceptanceHead {
+					t.Fatalf("release commit parent = %s, want %s", parent, acceptanceHead)
+				}
+				want["head_sha"], want["dirty"] = releasedHead, true
 			}
 			assertFields(one.Body["attempts"].([]any)[0].(map[string]any), want)
 			report := call(t, a, "GET", "/tasks/"+task.ID+"/evidence?attempt=1", "").Body["report"].(map[string]any)
@@ -461,6 +467,55 @@ func TestPostTaskRefusesWhatItMustNotQueue(t *testing.T) {
 	a.cfg.Repos = nil
 	if ans := call(t, a, "POST", "/tasks", validTask); ans.Status != http.StatusForbidden || ans.Code != "repos_not_configured" {
 		t.Fatalf("with no allowlist: %d %s", ans.Status, ans.Code)
+	}
+}
+
+func TestPostTaskRejectsUnsafeRefs(t *testing.T) {
+	for _, tc := range []struct{ name, ref string }{
+		{"forced refspec", "+refs/heads/main:refs/heads/other"},
+		{"refspec with destination", "refs/heads/main:refs/heads/other"},
+		{"force prefix", "+main"},
+		{"negative refspec", "^refs/heads/main"},
+		{"empty", ""},
+		{"blank", " \t"},
+		{"leading space", " main"},
+		{"trailing newline", "main\n"},
+		{"tab", "main\tother"},
+		{"carriage return", "main\rother"},
+		{"NUL", "main\x00other"},
+		{"control character", "main\x1fother"},
+		{"DEL", "main\x7fother"},
+		{"Unicode space", "main\u00a0other"},
+		{"over the byte limit", strings.Repeat("x", 201)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newTestApp(t)
+			ref, err := json.Marshal(tc.ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := strings.TrimSuffix(validTask, "}") + `,"ref":` + string(ref) + `}`
+			if ans := call(t, a, "POST", "/tasks", body); ans.Status != http.StatusBadRequest || ans.Code != "invalid_ref" {
+				t.Fatalf("POST /tasks with ref %q: got %d %s, want 400 invalid_ref", tc.ref, ans.Status, ans.Code)
+			}
+			if tasks, err := a.queue.ListTasks(TaskFilter{}); err != nil || len(tasks) != 0 {
+				t.Fatalf("queue has %d tasks after the rejected request: %v", len(tasks), err)
+			}
+		})
+	}
+}
+
+func TestPostTaskAcceptsCommitishRefs(t *testing.T) {
+	for _, ref := range []string{"main", "refs/heads/main", "HEAD^", "HEAD~1", "HEAD@{0}", strings.Repeat("x", 200)} {
+		a := newTestApp(t)
+		body := strings.TrimSuffix(validTask, "}") + `,"ref":"` + ref + `"}`
+		ans := call(t, a, "POST", "/tasks", body)
+		if ans.Status != http.StatusCreated {
+			t.Fatalf("POST /tasks with ref %q: got %d, want 201", ref, ans.Status)
+		}
+		if got := taskOf(t, ans)["ref"]; got != ref {
+			t.Errorf("stored ref = %q, want %q", got, ref)
+		}
 	}
 }
 
