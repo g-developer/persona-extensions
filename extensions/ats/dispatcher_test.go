@@ -11,6 +11,8 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -33,6 +35,10 @@ type todoAttachTestHub struct {
 
 func (h todoAttachTestHub) AttachTodo(ctx context.Context, todo, machine, session string) error {
 	return h.client.AttachTodo(ctx, todo, machine, session)
+}
+
+func (h todoAttachTestHub) DetachTodo(ctx context.Context, todo, machine, session string) error {
+	return h.client.DetachTodo(ctx, todo, machine, session)
 }
 
 func TestTodoAttachOutcomeIsVisibleAfterQueueReload(t *testing.T) {
@@ -667,8 +673,88 @@ func TestFailedAcceptanceIsRetriedAsANewAttemptThenFails(t *testing.T) {
 	if len(r.hub.created) != 2 || r.hub.created[0].Cwd == r.hub.created[1].Cwd {
 		t.Fatalf("attempts shared a worktree: %+v", r.hub.created)
 	}
+	if want := []string{"todo_1/session-1", "todo_1/session-2"}; !slices.Equal(r.hub.detached, want) {
+		t.Fatalf("detached %v, want %v", r.hub.detached, want)
+	}
 	if w := r.todos.written(); len(w) != 1 || w[0].Choice != "失败：没通过验收（试了 2 次）" {
 		t.Fatalf("decisions: %+v", w)
+	}
+}
+
+func TestRetryKeepsTheSuccessfulSessionAttached(t *testing.T) {
+	r := newRig(t)
+	one := 1
+	task := r.enqueue(EnqueueInput{MaxRetries: &one, AcceptanceCommand: "true"})
+	r.tick()
+	r.hub.set("session-1", func(s *hubSession) { s.StartError = "agent failed to start" })
+	r.tick()
+	failed := r.task(task.ID)
+	if failed.State != StateQueued || failed.NotBefore == nil {
+		t.Fatalf("after attempt failure: state %s, retry at %v", failed.State, failed.NotBefore)
+	}
+	if want := []string{"todo_1/session-1"}; !slices.Equal(r.hub.detached, want) {
+		t.Fatalf("detached %v before retry, want %v", r.hub.detached, want)
+	}
+
+	r.now = *failed.NotBefore
+	r.tick()
+	r.hub.turnEnds("session-2", "u1", "Done.")
+	r.tick()
+	r.tick()
+	r.waitAccepted(task.ID, 2)
+	r.tick()
+	got := r.task(task.ID)
+	if got.State != StateSucceeded || got.Verdict != VerdictPass || len(got.Attempts) != 2 || len(got.Reports) != 2 {
+		t.Fatalf("retry result: state %s, verdict %s, attempts %d, reports %d", got.State, got.Verdict, len(got.Attempts), len(got.Reports))
+	}
+	if want := []string{"todo_1/session-1", "todo_1/session-2"}; !slices.Equal(r.hub.attached, want) {
+		t.Fatalf("attached %v, want %v", r.hub.attached, want)
+	}
+	if want := []string{"todo_1/session-1"}; !slices.Equal(r.hub.detached, want) {
+		t.Fatalf("detached %v after retry, want %v", r.hub.detached, want)
+	}
+	rep := got.Reports[0]
+	if got.Attempts[0].SessionID != "session-1" || rep.SessionID != "session-1" {
+		t.Fatalf("failed session missing from history: attempt %q, report %q", got.Attempts[0].SessionID, rep.SessionID)
+	}
+	if !slices.Contains(rep.Artifacts, Artifact{Kind: "session", Path: testMachine + "/session-1"}) {
+		t.Fatalf("failed session missing from evidence: %v", rep.Artifacts)
+	}
+}
+
+func TestTodoDetachRetriesWhileTheNextAttemptIsActive(t *testing.T) {
+	r := newRig(t)
+	one := 1
+	task := r.enqueue(EnqueueInput{MaxRetries: &one})
+	r.tick()
+	r.hub.detachErr = errors.New("temporary hub failure")
+	r.hub.set("session-1", func(s *hubSession) { s.StartError = "agent failed to start" })
+	r.tick()
+	failed := r.task(task.ID)
+	if failed.State != StateQueued || failed.NotBefore == nil || !failed.Attempts[0].TodoDetachPending {
+		t.Fatalf("after detach failure: state %s, retry at %v, attempt %+v", failed.State, failed.NotBefore, failed.Attempts[0])
+	}
+
+	q, err := NewQueue(filepath.Dir(r.q.dataFile), r.cfg.queueConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.q = q
+	r.start(r.worker.data)
+	r.now = *failed.NotBefore
+	r.tick()
+	running := r.task(task.ID)
+	if running.State != StateRunning || running.AttemptNo != 2 || !running.Attempts[0].TodoDetachPending {
+		t.Fatalf("after reload and retry: state %s, attempt %d, detach pending %v", running.State, running.AttemptNo, running.Attempts[0].TodoDetachPending)
+	}
+
+	r.hub.detachErr = nil
+	r.tick()
+	if want := []string{"todo_1/session-1", "todo_1/session-1", "todo_1/session-1"}; !slices.Equal(r.hub.detached, want) {
+		t.Fatalf("detach calls %v, want %v", r.hub.detached, want)
+	}
+	if got := r.task(task.ID); got.State != StateRunning || got.Attempts[0].TodoDetachPending {
+		t.Fatalf("after detach retry: state %s, detach pending %v", got.State, got.Attempts[0].TodoDetachPending)
 	}
 }
 
@@ -748,6 +834,12 @@ func TestCancelInterruptsTheSessionAndRemovesTheWorktree(t *testing.T) {
 	if got.State != StateCanceled || !slices.Equal(r.hub.interrupts, []string{"session-1"}) {
 		t.Fatalf("state %s interrupts %v", got.State, r.hub.interrupts)
 	}
+	if want := []string{"todo_1/session-1"}; !slices.Equal(r.hub.detached, want) {
+		t.Fatalf("detached %v, want %v", r.hub.detached, want)
+	}
+	if got.Attempts[0].SessionID != "session-1" {
+		t.Fatalf("canceled session missing from history: %+v", got.Attempts[0])
+	}
 	if _, err := os.Stat(wt); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the worktree is still there: %v", err)
 	}
@@ -757,6 +849,30 @@ func TestCancelInterruptsTheSessionAndRemovesTheWorktree(t *testing.T) {
 	r.tick()
 	if len(r.hub.created) != 1 {
 		t.Fatal("a canceled task ran again")
+	}
+}
+
+func TestCanceledTodoDetachSurvivesPruningUntilRetried(t *testing.T) {
+	r := newRig(t)
+	task := r.enqueue(EnqueueInput{})
+	r.tick()
+	r.hub.detachErr = errors.New("temporary hub failure")
+	if got, err := r.d.cancel(t.Context(), task.ID); err != nil || got.State != StateCanceled {
+		t.Fatalf("cancel: task %+v, error %v", got, err)
+	}
+	if got := r.task(task.ID); !got.Attempts[0].TodoDetachPending || got.DecisionWrittenRef == "" {
+		t.Fatalf("after cancel: detach pending %v, decision ref %q", got.Attempts[0].TodoDetachPending, got.DecisionWrittenRef)
+	}
+
+	r.now = r.now.Add(pruneMaxAge)
+	r.tick()
+	if got := r.task(task.ID); !got.Attempts[0].TodoDetachPending {
+		t.Fatal("pruning dropped the pending detach")
+	}
+	r.hub.detachErr = nil
+	r.tick()
+	if got := r.task(task.ID); got.Attempts[0].TodoDetachPending || got.Attempts[0].SessionID != "session-1" {
+		t.Fatalf("attempt after detach retry: %+v", got.Attempts[0])
 	}
 }
 
@@ -1017,6 +1133,38 @@ func TestHubClientSendMessagePostsToTheExistingSession(t *testing.T) {
 	defer srv.Close()
 	if err := newHubClient(srv.URL, "test-token").SendMessage(t.Context(), "machine/one", "session/one", text); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestHubClientDetachTodo(t *testing.T) {
+	const path = "/api/v1/todos/todo%2Fone/agents/machine%2Fone/session%2Fone"
+	for _, status := range []int{http.StatusOK, http.StatusNoContent, http.StatusNotFound, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.Method != http.MethodDelete || req.URL.EscapedPath() != path {
+					t.Errorf("detach request: %s %s", req.Method, req.URL.EscapedPath())
+				}
+				w.WriteHeader(status)
+				if status == http.StatusInternalServerError {
+					_, _ = w.Write([]byte(`{"code":"internal_error","error":"could not unlink\nextra details"}`))
+				}
+			}))
+			defer srv.Close()
+			err := newHubClient(srv.URL, "test-token").DetachTodo(t.Context(), "todo/one", "machine/one", "session/one")
+			if status != http.StatusInternalServerError {
+				if err != nil {
+					t.Fatalf("HTTP %d: %v", status, err)
+				}
+				return
+			}
+			var apiErr *hubAPIError
+			if !errors.As(err, &apiErr) || apiErr.Status != status {
+				t.Fatalf("expected typed HTTP %d error, got %v", status, err)
+			}
+			if want := "DELETE " + path + ": HTTP 500 (internal_error) could not unlink"; err.Error() != want {
+				t.Fatalf("error %q, want %q", err, want)
+			}
+		})
 	}
 }
 
@@ -1359,6 +1507,69 @@ func TestCancelDuringCreateSessionInterruptsSessionAndReleasesWorktree(t *testin
 	}
 	if branches := runGit(t, r.repo, "branch", "--list", "ats/*"); branches != "" {
 		t.Fatalf("leaked branch: %q", branches)
+	}
+}
+
+func TestCancelDuringAttachDetachesSessionAfterAttachReturns(t *testing.T) {
+	r := newRig(t)
+	task := r.enqueue(EnqueueInput{})
+	started, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	releaseAttach := sync.OnceFunc(func() { close(release) })
+	var linked atomic.Bool
+	var deletes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if want := "/api/v1/todos/todo_1/agents/" + testMachine + "/session-1"; req.URL.Path != want {
+			t.Errorf("request path %q, want %q", req.URL.Path, want)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		switch req.Method {
+		case http.MethodPut:
+			close(started)
+			select {
+			case <-release:
+				linked.Store(true)
+				w.WriteHeader(http.StatusNoContent)
+			case <-req.Context().Done():
+			}
+		case http.MethodDelete:
+			deletes.Add(1)
+			if linked.Swap(false) {
+				w.WriteHeader(http.StatusNoContent)
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+			}
+		default:
+			t.Errorf("unexpected method %s", req.Method)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer srv.Close()
+	r.d.api = todoAttachTestHub{fakeHub: r.hub, client: newHubClient(srv.URL, "test-token")}
+	go func() {
+		defer close(done)
+		r.d.tick(t.Context())
+	}()
+	defer func() {
+		releaseAttach()
+		<-done
+	}()
+	select {
+	case <-started:
+	case <-done:
+		t.Fatal("dispatcher returned before starting the attachment")
+	}
+	cctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	canceled, err := r.d.cancel(cctx, task.ID)
+	if err != nil || canceled.State != StateCanceled {
+		t.Fatalf("cancel during attachment: task %+v, error %v", canceled, err)
+	}
+	releaseAttach()
+	<-done
+
+	if linked.Load() || deletes.Load() != 2 {
+		t.Fatalf("after attachment returned: linked %v, DELETE requests %d, want false and 2", linked.Load(), deletes.Load())
 	}
 }
 

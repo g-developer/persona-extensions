@@ -129,6 +129,7 @@ func (d *dispatcher) tick(ctx context.Context) {
 		_, _ = d.q.Prune(now, pruneMaxAge, pruneKeep)
 	}
 
+	d.retryPendingTodoDetaches(ctx)
 	moved := false
 	for _, t := range d.q.ActiveTasks() {
 		if d.advance(ctx, t) {
@@ -402,6 +403,11 @@ func (d *dispatcher) prepare(ctx context.Context, t *Task, att Attempt) bool {
 				e.TodoAttachError = warning
 			}); err != nil {
 				slog.Warn("ATS could not save to-do attachment error", "task_id", t.ID, "attempt", att.AttemptNo, "error", err)
+			}
+		} else if cur, err := d.q.GetTask(t.ID); err == nil && (cur.FenceToken != t.FenceToken || !isActiveState(cur.State)) {
+			// A cancel can finish before the hub applies the attachment.
+			if !d.detachTodoSession(ctx, t.ID, att.AttemptNo, todo, e.MachineID, sid) {
+				_ = d.q.SetAttemptTodoDetachPending(t.ID, att.AttemptNo, true)
 			}
 		}
 	}
@@ -990,6 +996,10 @@ func (d *dispatcher) finish(ctx context.Context, t *Task, att Attempt, out outco
 		d.mu.Unlock()
 	}
 	arts, releasedHeadSHA, relDirty := d.cleanup(ctx, t, att.AttemptNo, false)
+	todoDetachPending := false
+	if out.state != StateSucceeded && t.Exec != nil {
+		todoDetachPending = !d.detachTodoSession(ctx, t.ID, att.AttemptNo, t.TodoID(), t.Exec.MachineID, t.Exec.SessionID)
+	}
 	out.headSHA = cmpOr(releasedHeadSHA, out.headSHA)
 	// 验收发现的修改需要保留为证据，即使释放时已自动提交。
 	if relDirty != nil && (out.dirty == nil || *relDirty) {
@@ -1015,6 +1025,7 @@ func (d *dispatcher) finish(ctx context.Context, t *Task, att Attempt, out outco
 		Outcome: out.state, Verdict: out.verdict, ErrorClass: out.errClass, ExitCode: out.exitCode,
 		Message: out.message, Summary: out.summary, FullReply: out.fullReply, HeadSHA: out.headSHA, Dirty: out.dirty,
 		Artifacts: append(out.artifacts, arts...), Retryable: retryable, Now: now,
+		TodoDetachPending: todoDetachPending,
 	}
 	if e := t.Exec; e != nil {
 		in.Launcher, in.Model, in.SessionID, in.Worktree, in.BaseSHA = e.Launcher, e.Model, e.SessionID, e.Worktree, e.BaseSHA
@@ -1028,6 +1039,28 @@ func (d *dispatcher) finish(ctx context.Context, t *Task, att Attempt, out outco
 	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	_, _ = d.writer.WriteTaskOutcome(wctx, d.q, done.ID)
 	cancel()
+}
+
+func (d *dispatcher) detachTodoSession(ctx context.Context, taskID string, attempt int, todoID, machineID, sessionID string) bool {
+	if todoID == "" || machineID == "" || sessionID == "" {
+		return true
+	}
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := d.api.DetachTodo(dctx, todoID, machineID, sessionID); err != nil {
+		slog.Warn("ATS could not detach failed session from to-do", "task_id", taskID, "attempt", attempt,
+			"todo_id", todoID, "machine_id", machineID, "session_id", sessionID, "error", err)
+		return false
+	}
+	return true
+}
+
+func (d *dispatcher) retryPendingTodoDetaches(ctx context.Context) {
+	for _, item := range d.q.PendingTodoDetaches() {
+		if d.detachTodoSession(ctx, item.TaskID, item.AttemptNo, item.TodoID, item.MachineID, item.SessionID) {
+			_ = d.q.SetAttemptTodoDetachPending(item.TaskID, item.AttemptNo, false)
+		}
+	}
 }
 
 // mergeCommit 优先采用 release 读取的最终 HEAD。只有偏离起点的提交进入证据。
@@ -1107,7 +1140,11 @@ func (d *dispatcher) cancel(ctx context.Context, taskID string) (*Task, error) {
 		return t, nil
 	}
 	if before.Exec != nil && len(before.Attempts) > 0 {
-		d.cleanup(ctx, before, before.Attempts[len(before.Attempts)-1].AttemptNo, true)
+		attemptNo := before.Attempts[len(before.Attempts)-1].AttemptNo
+		d.cleanup(ctx, before, attemptNo, true)
+		if !d.detachTodoSession(ctx, before.ID, attemptNo, before.TodoID(), before.Exec.MachineID, before.Exec.SessionID) {
+			_ = d.q.SetAttemptTodoDetachPending(before.ID, attemptNo, true)
+		}
 	}
 	if d.writer != nil && d.writer.HasTodosWriteScope() {
 		_, _ = d.writer.WriteTaskOutcome(ctx, d.q, t.ID)

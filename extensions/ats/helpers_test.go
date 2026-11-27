@@ -76,8 +76,10 @@ type fakeHub struct {
 	interrupts      []string
 	messages        []sentMessage
 	attached        []string
+	detached        []string
 	createErr       error
 	sendErr         error
+	detachErr       error
 	onCreateSession func(sessionRequest)
 	// interactions are the pending cards; interactionsErr makes the list fail; interactionCalls counts the asks.
 	interactions     []hubInteraction
@@ -163,6 +165,16 @@ func (f *fakeHub) AttachTodo(_ context.Context, todoID, _ string, sessionID stri
 	defer f.mu.Unlock()
 	f.attached = append(f.attached, todoID+"/"+sessionID)
 	return nil
+}
+
+func (f *fakeHub) DetachTodo(ctx context.Context, todoID, _ string, sessionID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.detached = append(f.detached, todoID+"/"+sessionID)
+	return f.detachErr
 }
 
 func (f *fakeHub) Interactions(context.Context) ([]hubInteraction, error) {

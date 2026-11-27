@@ -625,6 +625,38 @@ func TestPruneDropsOldFinishedTasksOnly(t *testing.T) {
 	}
 }
 
+func TestPendingTodoDetachSkipsActiveAttemptAndRollsBackOnSaveError(t *testing.T) {
+	q := newTestQueue(t, DefaultQueueConfig())
+	task := mustEnqueue(t, q, EnqueueInput{Labels: map[string]string{PersonaTodoLabel: "todo_1"}})
+	_, att, err := q.LeaseTask(task.ID, "worker", testMachine, testStart)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.UpdateExec(task.ID, att.FenceToken, testStart, func(e *Execution) {
+		e.SessionID = "session-1"
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.SetAttemptTodoDetachPending(task.ID, att.AttemptNo, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := q.PendingTodoDetaches(); len(got) != 0 {
+		t.Fatalf("active attempt eligible for detach: %+v", got)
+	}
+	if _, err := q.CancelTask(task.ID, testStart); err != nil {
+		t.Fatal(err)
+	}
+
+	q.dataFile = filepath.Join(t.TempDir(), "missing", "queue.json")
+	if err := q.SetAttemptTodoDetachPending(task.ID, att.AttemptNo, false); err == nil {
+		t.Fatal("expected queue save to fail")
+	}
+	want := pendingTodoDetach{TaskID: task.ID, AttemptNo: att.AttemptNo, TodoID: "todo_1", MachineID: testMachine, SessionID: "session-1"}
+	if got := q.PendingTodoDetaches(); len(got) != 1 || got[0] != want {
+		t.Fatalf("pending detaches after save failure: %+v, want %+v", got, want)
+	}
+}
+
 func TestOutcomeIsWrittenToTheTodoOnce(t *testing.T) {
 	q := newTestQueue(t, DefaultQueueConfig())
 	todos := newTodoServer(t)

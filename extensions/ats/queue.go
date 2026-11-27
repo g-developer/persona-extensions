@@ -167,7 +167,8 @@ type Attempt struct {
 	Verdict        string     `json:"verdict,omitempty"`
 	Summary        string     `json:"summary,omitempty"`
 
-	TodoAttachError string `json:"todo_attach_error,omitempty"`
+	TodoAttachError   string `json:"todo_attach_error,omitempty"`
+	TodoDetachPending bool   `json:"todo_detach_pending,omitempty"`
 }
 
 // EvidenceReport stores a verification report from an attempt.
@@ -632,6 +633,16 @@ type CompleteAttemptInput struct {
 	Artifacts  []Artifact
 	Retryable  *bool
 	Now        time.Time
+
+	TodoDetachPending bool
+}
+
+type pendingTodoDetach struct {
+	TaskID    string
+	AttemptNo int
+	TodoID    string
+	MachineID string
+	SessionID string
 }
 
 // TaskFilter specifies filtering criteria for ListTasks.
@@ -1254,6 +1265,7 @@ func (q *Queue) CompleteAttempt(in CompleteAttemptInput) (*Task, error) {
 	att.Launcher, att.Model, att.SessionID, att.Worktree = in.Launcher, in.Model, in.SessionID, in.Worktree
 	att.BaseSHA, att.HeadSHA, att.FullReply = in.BaseSHA, in.HeadSHA, in.FullReply
 	att.Dirty = cloneBoolPtr(in.Dirty)
+	att.TodoDetachPending = in.TodoDetachPending
 	att.Summary = firstLinePreview(in.Message, 200)
 	t.Summary = att.Summary
 
@@ -1310,6 +1322,58 @@ func (q *Queue) CompleteAttempt(in CompleteAttemptInput) (*Task, error) {
 		return nil, err
 	}
 	return cloneTask(t), nil
+}
+
+// PendingTodoDetaches returns unfinished unlink requests for attempts that no longer hold the lease.
+func (q *Queue) PendingTodoDetaches() []pendingTodoDetach {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+
+	var pending []pendingTodoDetach
+	for _, t := range q.tasks {
+		todoID := t.TodoID()
+		if todoID == "" {
+			continue
+		}
+		active := isActiveState(t.State)
+		for i, att := range t.Attempts {
+			if !att.TodoDetachPending || (active && i == len(t.Attempts)-1) || att.Machine == "" || att.SessionID == "" {
+				continue
+			}
+			pending = append(pending, pendingTodoDetach{
+				TaskID: t.ID, AttemptNo: att.AttemptNo, TodoID: todoID, MachineID: att.Machine, SessionID: att.SessionID,
+			})
+		}
+	}
+	return pending
+}
+
+// SetAttemptTodoDetachPending saves whether the attempt's to-do link still needs to be removed.
+func (q *Queue) SetAttemptTodoDetachPending(taskID string, attemptNo int, pending bool) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	t, ok := q.tasks[taskID]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	for i := range t.Attempts {
+		att := &t.Attempts[i]
+		if att.AttemptNo != attemptNo {
+			continue
+		}
+		prev := att.TodoDetachPending
+		if prev == pending {
+			return nil
+		}
+		att.TodoDetachPending = pending
+		if err := q.saveLocked(); err != nil {
+			att.TodoDetachPending = prev
+			return err
+		}
+		return nil
+	}
+	return ErrStaleAttempt
 }
 
 func (q *Queue) hasHealthyAlternateLocked(requiredMachine, failedMachine string) bool {
